@@ -18,11 +18,10 @@ echoxflow/
     croissant.json                     未修改的官方完整目录
     splits.csv                         未修改的官方完整划分
     LICENSE                            官方许可证
-  legacy_provenance/                    旧实验实际使用的样本清单、划分及配置依据
   README_zh.md                          本说明
 ```
 
-`raw/` 可直接供官方读取工具使用。`source/` 用于确认原始来源及重新下载；`legacy_provenance/` 只用于理解历史实验，不参与新数据读取。
+`raw/` 可直接供官方读取工具使用。`source/` 用于确认原始来源及重新下载。
 
 ## 标注与视频关联
 

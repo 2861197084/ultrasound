@@ -4,7 +4,7 @@
 
 既有实验使用 `configs/echoxflow_mask_pairs.json` 和仓库自身模型/训练实现，使用 291 段连续图像及固定划分：119 训练、46 验证、64 测试，另 62 段 review 不用于训练/验证。实验成果和配置保留；旧 ED/ES、连续图像与 mask 缓存均需从新原始库重建后才能重新训练。
 
-历史配置中的 `prepared`、`pairs` 和 `raw` 路径当前不存在。样本清单及关联保存在 `../data/echoxflow/legacy_provenance/`，固定划分位于 `../data/echoxflow/legacy_provenance/EchoTracker2/outputs/echoxflow_ed_es_finetune/split.json`；历史配置的 `split_manifest` 仍保留旧路径，新运行需指定实际位置。`echo_masks` 读取已有连续图像与 ED/ES 缓存，不负责从原始库生成这些输入。
+历史配置中的 `prepared`、`pairs` 和 `raw` 路径当前不存在。固定划分位于 `runs/echoxflow_mask_pairs/split.json`，与正式运行记录的划分哈希一致；历史配置的 `split_manifest` 仍保留旧路径，新运行需指定实际位置，并依据原始库和保留的运行材料重建输入。`echo_masks` 读取已有连续图像与 ED/ES 缓存，不负责从原始库生成这些输入。
 
 连续评测和报告还依赖 EchoTracker2 的本地扩展模块 `evaluate`、`evaluation_data`、`analyze_echoxflow_sequences` 和 `analyze_finetuning`，上游原始版本不包含这些模块。需恢复或替换这些依赖，再按历史时相、几何、样本 ID 和划分重建缓存。输入、依赖和独立输出均准备好后，在 `/root/ultrasound/m2p` 使用以下入口：
 
@@ -29,7 +29,6 @@
 |---|---|
 | `../data/echoxflow/raw/` | 左心室 A4C、A2C、ALAX 标注及关联原始视频，1,323 个 Zarr、13,085 个数组 |
 | `../data/echoxflow/source/` | 官方完整目录、五折划分、许可证 |
-| `../data/echoxflow/legacy_provenance/` | 旧实验实际使用的样本清单和划分 |
 | `../data/youtubevos2019/` | YouTube-VOS 2019 原始训练、验证图像、掩膜和元数据 |
 | `../data/natural/DAVIS/` | DAVIS 2017 原始图像、掩膜、划分和说明 |
 | `../data/benchmarks/` | 官方 TAP-Vid DAVIS 和 RGB-Stacking 数据 |
@@ -71,5 +70,3 @@ python3.11 -m venv .venv-train
 .venv-train/bin/python -m pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
 .venv-train/bin/python -m pip install -r requirements-train.txt
 ```
-
-不应复用已删除实验的检查状态或结果来声称新实验已通过验证。
