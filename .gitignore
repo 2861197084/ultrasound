@@ -1,0 +1,41 @@
+# 共享数据：仅跟踪说明、许可证和保留的固定划分
+/data/*
+!/data/echoxflow/
+/data/echoxflow/*
+!/data/echoxflow/README_zh.md
+!/data/echoxflow/source/
+/data/echoxflow/source/*
+!/data/echoxflow/source/LICENSE
+!/data/echoxflow/legacy_provenance/
+/data/echoxflow/legacy_provenance/**/*
+!/data/echoxflow/legacy_provenance/**/
+!/data/echoxflow/legacy_provenance/EchoTracker2/outputs/echoxflow_ed_es_finetune/split.json
+
+# 下载的依赖、初始化权重和本地实验产物
+/m2p/vendor/
+/m2p/runs/
+/m2p/assets/*
+!/m2p/assets/tapvid_evaluation_datasets.py
+!/m2p/assets/TAPNET_LICENSE
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+
+# Python 环境与临时缓存
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+
+# 本地凭据与环境配置
+.env
+.env.*
+!.env.example
