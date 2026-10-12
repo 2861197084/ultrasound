@@ -1,6 +1,0 @@
-[submodule "EchoTracker2"]
-	path = EchoTracker2
-	url = https://github.com/riponazad/ptecho.git
-[submodule "SemiEchoTracker"]
-	path = SemiEchoTracker
-	url = https://github.com/Fitz-Fitz/SemiEchoTracker.git

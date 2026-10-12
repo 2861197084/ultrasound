@@ -12,6 +12,10 @@
 !/data/echoxflow/legacy_provenance/EchoTracker2/outputs/echoxflow_ed_es_finetune/split.json
 
 # 下载的依赖、初始化权重和本地实验产物
+/EchoTracker2/weights/
+/EchoTracker2/outputs/
+/SemiEchoTracker/weights/
+/SemiEchoTracker/results/
 /m2p/vendor/
 /m2p/runs/
 /m2p/assets/*
