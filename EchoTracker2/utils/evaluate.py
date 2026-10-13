@@ -9,6 +9,41 @@ import numpy as np
 from typing import Mapping
 
 
+def compute_reference_metrics(reference, prediction, valid, query_frame=0):
+    """单视频软件参考轨迹指标；输入为像素 xy、[T,N,2] 和 [T,N]。
+
+    阈值严格使用 <，输出百分比；MTE 为每点时间中位数的点均值。
+    valid 是参考有效性，不能用来声称模型预测了可见性。
+    """
+    reference = np.asarray(reference)
+    prediction = np.asarray(prediction)
+    valid = np.asarray(valid, dtype=bool).copy()
+    if reference.shape != prediction.shape or reference.shape[:-1] != valid.shape:
+        raise ValueError("Reference/prediction/mask shapes must be [T,N,2], [T,N]")
+    if reference.ndim != 3 or reference.shape[-1] != 2:
+        raise ValueError("Expected [T,N,2] xy trajectories")
+    if not 0 <= query_frame < len(reference):
+        raise ValueError("Query frame outside the sequence")
+    valid[query_frame] = False
+    if not valid.any():
+        raise ValueError("No reference positions remain after excluding the query")
+    if not np.isfinite(reference[valid]).all() or not np.isfinite(prediction).all():
+        raise ValueError("Nonfinite reference or predicted trajectory")
+    delta = np.where(valid[..., None], prediction - reference, 0.0)
+    result = {"valid_positions": int(valid.sum()), "query_points": int(valid.shape[1])}
+    for norm, distance in (("l1", np.abs(delta).sum(-1)),
+                           ("l2", np.linalg.norm(delta, axis=-1))):
+        thresholds = (1, 2, 4) if norm == "l1" else (1, 2, 4, 8, 16)
+        for threshold in thresholds:
+            result[f"{norm}_delta_{threshold}"] = float((distance[valid] < threshold).mean() * 100)
+        result[f"{norm}_davg_1_2_4"] = float(np.mean([result[f"{norm}_delta_{x}"] for x in (1, 2, 4)]))
+        per_point = [np.median(distance[valid[:, p], p]) for p in range(valid.shape[1]) if valid[:, p].any()]
+        result[f"{norm}_mte"] = float(np.mean(per_point))
+        result[f"{norm}_mean_error"] = float(distance[valid].mean())
+    result["l2_davg_1_2_4_8_16"] = float(np.mean([result[f"l2_delta_{x}"] for x in (1, 2, 4, 8, 16)]))
+    return result
+
+
 
 
 

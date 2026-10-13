@@ -7,6 +7,9 @@ import numpy as np
 from torchvision import transforms as T
 import random
 import albumentations as A
+import hashlib
+import json
+from pathlib import Path
 
 class EchoDataset(Dataset):
     def __init__(self, root_dir="", transform=None, frame_num=10, splits='train',
@@ -172,3 +175,81 @@ class EchoDataset(Dataset):
             'rescale_x': rescale_x,
             'rescale_y': rescale_y
         }
+
+
+class EchoXFlowDataset(EchoDataset):
+    """固定 10 帧数据；训练缓存只包含端点坐标，不读取原始轮廓。"""
+
+    def read_data(self):
+        if self.frame_num != 10:
+            raise ValueError('EchoXFlow prepared protocol requires frame_num=10')
+        root = Path(self.root_dir)
+        self.manifest_path = root / 'manifest.json'
+        self.manifest_sha256 = hashlib.sha256(self.manifest_path.read_bytes()).hexdigest()
+        manifest = json.loads(self.manifest_path.read_text())
+        if not manifest['complete'] or manifest['dataset'] != 'EchoXFlow A4C':
+            raise ValueError('Incomplete or incompatible EchoXFlow preparation')
+        split_path = root / f'{self.splits}.txt'
+        if hashlib.sha256(split_path.read_bytes()).hexdigest() != manifest['split_sha256'][self.splits]:
+            raise ValueError('EchoXFlow split checksum mismatch')
+        ids = split_path.read_text().splitlines()
+        records = {row['sample_id']: row for row in manifest['samples'] if row['split'] == self.splits}
+        if len(ids) != len(set(ids)) or set(ids) != set(records):
+            raise ValueError('EchoXFlow split does not match manifest')
+        data = []
+        for sid in ids:
+            path = root / records[sid]['data_path']
+            if hashlib.sha256(path.read_bytes()).hexdigest() != records[sid]['data_sha256']:
+                raise ValueError(f'EchoXFlow data checksum mismatch: {sid}')
+            with np.load(path, allow_pickle=False) as archive:
+                item = {key: archive[key] for key in archive.files}
+            expected_frames = np.array([0, 9]) if self.splits == 'train' else np.arange(10)
+            if (item['video'].shape != (10, 224, 224, 3)
+                    or item['landmarks'].shape != (len(expected_frames), 3, 2)
+                    or not np.array_equal(item['label_frame_indices'], expected_frames)
+                    or not item['valid_mask'].all()):
+                raise ValueError(f'EchoXFlow label scope or shape mismatch: {sid}')
+            item['patient'] = sid
+            data.append(item)
+        return data
+
+    def __getitem__(self, idx):
+        item = self.data_list[idx]
+        native_h, native_w = item['video'].shape[1:3]
+        height, width = self.target_size
+        sx, sy = width / native_w, height / native_h
+        # OpenCV resize 使用像素中心；随后对图像和全部已提供标签使用同一旋转矩阵。
+        resize = np.array([[sx, 0, (sx-1)/2], [0, sy, (sy-1)/2], [0, 0, 1]], dtype=np.float64)
+        angle = (random.uniform(-self.rotation_limit, self.rotation_limit)
+                 if self.rotation and random.random() < self.rotation_prob else 0.)
+        rotate = np.eye(3)
+        rotate[:2] = cv2.getRotationMatrix2D(((width-1)/2, (height-1)/2), angle, 1.)
+        native_to_input = rotate @ resize
+        landmarks = (item['landmarks'] @ native_to_input[:2, :2].T + native_to_input[:2, 2]).astype(np.float32)
+        replay = None
+        frames = []
+        for image in item['video']:
+            image = cv2.resize(image, (width, height))
+            if angle:
+                image = cv2.warpAffine(image, rotate[:2], (width, height),
+                                       flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+            if self.transform:
+                if isinstance(self.transform, A.ReplayCompose):
+                    augmented = (self.transform(image=image) if replay is None
+                                 else A.ReplayCompose.replay(replay, image=image))
+                    replay = augmented['replay']
+                else:
+                    augmented = self.transform(image=image)
+                image = augmented['image']
+            frames.append(self.normalize(image))
+        return dict(video=torch.stack(frames), landmarks=landmarks, patient_name=item['patient'],
+                    label_frame_indices=item['label_frame_indices'].copy(),
+                    frame_indices=item['frame_indices'].copy(),
+                    timestamps_seconds=item['timestamps_seconds'].copy(),
+                    input_to_mm=item['native_to_mm'] @ np.linalg.inv(native_to_input),
+                    rescale_x=1/sx, rescale_y=1/sy)
+
+
+def make_dataset(**kwargs):
+    dataset_class = EchoXFlowDataset if kwargs.get('data_type') == 'echoxflow' else EchoDataset
+    return dataset_class(**kwargs)

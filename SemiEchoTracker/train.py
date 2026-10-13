@@ -12,10 +12,19 @@ import logging
 import argparse
 from tqdm import tqdm
 import shutil
+import hashlib
+from importlib.metadata import distributions
+import json
+import platform
+from pathlib import Path
+import subprocess
+import sys
+import time
+from collections import defaultdict
 
 from models.SemiEchoTracker import SemiEchoTracker
 from models.dinov2 import get_dinov2_model
-from dataset.echo_dataset import EchoDataset
+from dataset.echo_dataset import make_dataset
 
 
 def setup_logging(log_dir):
@@ -31,11 +40,11 @@ def setup_logging(log_dir):
     )
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description='SemiEchoTracker')
     parser.add_argument('--data_dir', type=str, default='../data/', help='Path to the dataset')
     parser.add_argument('--data_type', type=str, default='PLAX', help='Data type')
-    parser.add_argument('--image_size', type=tuple, default=(224, 224), help='Image size')
+    parser.add_argument('--image_size', type=int, nargs=2, default=(224, 224), help='Image size')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for training')
     parser.add_argument('--epochs', type=int, default=300, help='Number of epochs to train')
     parser.add_argument('--frame_num', type=int, default=10, help='Number of frames')
@@ -104,7 +113,19 @@ def parse_args():
     parser.add_argument('--num_workers', type=int, default=6, help='DataLoader worker processes')
     parser.add_argument('--grad_accum_steps', type=int, default=1,
                         help='Accumulate gradients over this many mini-batches before each optimizer step')
-    args = parser.parse_args()
+    parser.add_argument('--optimizer', choices=['adam', 'adamw'], default='adamw')
+    parser.add_argument('--seed', type=int, default=33)
+    parser.add_argument('--backbone_source', choices=['guided', 'public'], default='guided')
+    parser.add_argument('--backbone_repo', type=str)
+    parser.add_argument('--backbone_checkpoint', type=str)
+    parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp16')
+    parser.add_argument('--resume', type=str, help='Resume an exact configuration from latest_model.pth')
+    args = parser.parse_args(argv)
+    args.image_size = tuple(args.image_size)
+    if args.mode is not None:
+        args.training_mode = args.mode
+    if args.batch_size < 1 or args.grad_accum_steps < 1:
+        parser.error('batch_size and grad_accum_steps must be positive')
     if args.detector_only:
         args.training_mode = 'detector_only'
     return args
@@ -132,45 +153,55 @@ def process_features(dinov2_model, inputs, B, T, H, W):
     return extra_feature, cls_token
 
 
-def soft_wing_loss(pred, target, omega=5.0, epsilon=2.0):
-    """Soft Wing Loss implementation with numerical stability improvements"""
-    diff = torch.abs(pred - target)
-    # Add gradient clipping to prevent explosion
-    diff = torch.clamp(diff, max=100.0)
-    # Add small epsilon to prevent log(0)
-    delta = omega * (1 - torch.log(1 + diff/(epsilon + 1e-8)))
-    loss = torch.where(diff < omega, delta, diff - omega/2)
-    return torch.mean(torch.clamp(loss, min=-100.0, max=100.0))
+def coordinate_loss_elementwise(pred, target):
+    """论文的逐点欧氏距离；FP32 避免混合精度下小误差丢失。"""
+    return torch.linalg.vector_norm(pred.float() - target.float(), dim=-1)
 
 
 def coordinate_loss(pred, target):
-    return soft_wing_loss(pred, target)
-
-
-def coordinate_loss_elementwise(pred, target):
-    diff = torch.clamp(torch.abs(pred - target), max=100.0)
-    delta = 5.0 * (1 - torch.log(1 + diff / (2.0 + 1e-8)))
-    return torch.clamp(torch.where(diff < 5.0, delta, diff - 2.5), min=-100.0, max=100.0)
+    return coordinate_loss_elementwise(pred, target).mean()
 
 
 def masked_coordinate_loss(pred, target, point_weights, args):
+    distances = coordinate_loss_elementwise(pred, target)
     if point_weights is None:
-        return coordinate_loss(pred, target)
-    weights = point_weights.to(device=pred.device, dtype=pred.dtype)
-    while weights.dim() < pred.dim():
-        weights = weights.unsqueeze(-1)
-    elem_loss = coordinate_loss_elementwise(pred, target)
-    if args.consistency_mask_normalization == 'total':
-        denom = torch.as_tensor(
-            weights.numel() * pred.shape[-1],
-            device=pred.device,
-            dtype=pred.dtype,
-        )
+        return distances.mean()
+    weights = point_weights.to(distances)
+    denominator = distances.numel() if args.consistency_mask_normalization == 'total' else weights.sum().clamp_min(1)
+    return (distances * weights).sum() / denominator
+
+
+def velocity_consistency_loss(forward_offsets, backward_offsets):
+    # 返回的反向 offsets 已按时间正序排列；两侧对齐中间帧的到达速度。
+    forward_speed = torch.linalg.vector_norm(forward_offsets[:, :-1].float(), dim=-1)
+    backward_speed = torch.linalg.vector_norm(backward_offsets[:, 1:].float(), dim=-1)
+    return (forward_speed - backward_speed).abs().mean()
+
+
+def co_training_loss(detector, forward, backward, weights, args):
+    return (masked_coordinate_loss(detector, forward, weights, args)
+            + masked_coordinate_loss(detector, backward, weights, args))
+
+
+def prediction_errors_mm(pred, target, batch, data_type):
+    difference = pred.float() - target.float()
+    if data_type == 'echoxflow':
+        linear = batch['input_to_mm'].to(device=pred.device, dtype=torch.float32)[:, :2, :2]
+        difference = torch.einsum('bij,btnj->btni', linear, difference)
     else:
-        denom = weights.sum() * pred.shape[-1]
-    if denom <= 0:
-        return pred.sum() * 0.0
-    return (elem_loss * weights).sum() / torch.clamp(denom, min=1.0)
+        scale = torch.stack([batch['rescale_x'], batch['rescale_y']], dim=-1).to(difference)
+        difference = difference * scale[:, None, None] * (0.6 if data_type == 'PLAX' else 0.67)
+    return torch.linalg.vector_norm(difference, dim=-1)
+
+
+def labelled_predictions(pred, batch):
+    if 'label_frame_indices' in batch:
+        indices = batch['label_frame_indices'].to(pred.device)
+    elif batch['landmarks'].shape[1] == 2:
+        indices = torch.tensor([0, pred.shape[1]-1], device=pred.device).expand(pred.shape[0], -1)
+    else:
+        indices = torch.arange(pred.shape[1], device=pred.device).expand(pred.shape[0], -1)
+    return pred.gather(1, indices[:, :, None, None].expand(-1, -1, pred.shape[2], 2))
 
 
 def tracker_agreement_weights(forward_coords, backward_coords, args):
@@ -213,317 +244,91 @@ def is_tracker_parameter(name):
 
 
 
-def train_or_validate(model, dinov2_model, data_loader, optimizer, device, epoch, 
+def train_or_validate(model, dinov2_model, data_loader, optimizer, device, epoch,
                      writer, scaler, args, is_training=True):
-    """Training/validation loop
-    
-    Args:
-        model: Main model
-        dinov2_model: Feature extraction model
-        data_loader: Data loader
-        optimizer: Optimizer
-        device: Computing device
-        epoch: Current epoch
-        writer: Tensorboard writer
-        scaler: Gradient scaler for mixed precision
-        args: Training arguments
-        is_training: Whether in training mode
-        
-    Returns:
-        Dictionary of metrics
-    """
-    if is_training:
-        model.train()
-    else:
-        model.eval()
+    model.train(is_training)
     dinov2_model.eval()
-    error_init_landmark_all, error_tracking_landmark_all, error_init_all = [], [], []
-    error_detection_endpoint_all, error_full_sequence_tracking_all = [], []
-    total_loss = 0
-    total_loss_landmarks = 0
-    total_loss_consistency = 0
-    total_loss_tracking = 0
-    total_loss_velocity = 0
-    total_loss_tracking_supervised = 0
-    total_consistency_mask_fraction = 0.0
-    consistency_mask_count = 0
-    desc = 'Training' if is_training else 'Validating'
-    pbar = tqdm(data_loader, desc=f'{desc} Epoch {epoch}')
-    spacing = 0.6 if args.data_type == 'PLAX' else 0.67
-    detector_only = args.training_mode == 'detector_only' or not is_training
-    grad_accum_steps = max(1, args.grad_accum_steps) if is_training else 1
-    
-    for batch_idx, batch_data in enumerate(pbar):
-        loss_mutual_consistency = torch.tensor(0.0, device=device)
-        loss_tracking_supervised = torch.tensor(0.0, device=device)
-        loss_velocity = torch.tensor(0.0, device=device)
-        loss_tracking = torch.tensor(0.0, device=device)
-        consistency_mask_fraction = None
-        if is_training and batch_idx % grad_accum_steps == 0:
-            optimizer.zero_grad()
-        # Get batch data
-        inputs = batch_data['video'].to(device).float()
-        landmarks = batch_data['landmarks'].to(device).float()
-        rescale_x = batch_data['rescale_x'].cpu().numpy() # B
-        rescale_y = batch_data['rescale_y'].cpu().numpy() # B
-        B, T, c, H, W = inputs.shape
-        inputs = inputs.view(B*T, c, H, W)
-        # Extract features
-        extra_feature, cls_token = process_features(dinov2_model, inputs, B, T, H, W)
-        del inputs
-        # Forward pass
-        with torch.set_grad_enabled(is_training):
-            with torch.amp.autocast('cuda') if is_training else torch.no_grad():
-                if detector_only:
-                    spatial_init = model(extra_feature, cls_token, infer_mode=True)
-                    pred_coords_forward = None
-                    pred_coords_backward = None
-                else:
-                    # Get detector and bidirectional tracker predictions.
-                    # During training seed the tracker from GT endpoints for a clean
-                    # supervision signal; during validation use detector predictions.
-                    if is_training:
-                        tracker_seed_coords = torch.stack(
-                            [landmarks[:, 0], landmarks[:, -1]], dim=1
-                        ).clone()
-                        tracker_seed_coords[..., 0] = tracker_seed_coords[..., 0].clamp(0, args.image_size[1] - 1) / (args.image_size[1] - 1)
-                        tracker_seed_coords[..., 1] = tracker_seed_coords[..., 1].clamp(0, args.image_size[0] - 1) / (args.image_size[0] - 1)
-                    else:
-                        tracker_seed_coords = None
-                    pred_coords_forward, pred_coords_backward, pred_offset_forward, pred_offset_backward, spatial_init = model(
-                        extra_feature,
-                        cls_token,
-                        tracker_seed_coords=tracker_seed_coords,
-                        detach_tracker_inputs=args.detach_tracker_inputs,
-                    )
-
-                # Supervised loss for the detector at the labelled endpoint frames.
-                loss_landmarks_init = coordinate_loss(spatial_init[:, 0], landmarks[:, 0]) + \
-                                      coordinate_loss(spatial_init[:, -1], landmarks[:, -1])
-                loss = loss_landmarks_init * args.endpoint_supervision_weight
-
-                if not detector_only:
-                    loss_tracking_supervised = coordinate_loss(pred_coords_forward[:, -1], landmarks[:, -1]) + \
-                                               coordinate_loss(pred_coords_backward[:, 0], landmarks[:, 0])
-                    loss_velocity = coordinate_loss(
-                        torch.norm(pred_offset_forward, dim=-1),
-                        torch.norm(pred_offset_backward, dim=-1),
-                    )
-                    loss_tracking = coordinate_loss(pred_coords_forward, pred_coords_backward)
-
-                    invalid_loss = False
-                    for loss_name, loss_value in (
-                        ('loss_landmarks_init', loss_landmarks_init),
-                        ('loss_tracking_supervised', loss_tracking_supervised),
-                        ('loss_velocity', loss_velocity),
-                        ('loss_tracking', loss_tracking),
-                    ):
-                        if torch.isnan(loss_value) or torch.isinf(loss_value):
-                            logging.warning(f"NaN/Inf detected in {loss_name} at epoch {epoch}")
-                            invalid_loss = True
-                    if invalid_loss:
-                        continue
-
-                    loss = loss + loss_tracking_supervised * args.tracking_supervised
-                    loss = loss + loss_velocity * args.velocity
-                    loss = loss + loss_tracking * args.tracking
-
-                    # Detector-tracker co-training on unlabeled middle frames.
-                    if epoch >= args.cons_epoch:
-                        tracker_forward_teacher = pred_coords_forward[:, 1:-1]
-                        tracker_backward_teacher = pred_coords_backward[:, 1:-1]
-                        detector_student = spatial_init[:, 1:-1]
-                        if args.detach_tracker_teacher:
-                            tracker_forward_teacher = tracker_forward_teacher.detach()
-                            tracker_backward_teacher = tracker_backward_teacher.detach()
-                        if tracker_forward_teacher.numel() > 0:
-                            consistency_weights = tracker_agreement_weights(
-                                tracker_forward_teacher,
-                                tracker_backward_teacher,
-                                args,
-                            )
-                            if consistency_weights is not None:
-                                consistency_mask_fraction = consistency_weights.float().mean()
-                            tracker_teacher = 0.5 * (tracker_forward_teacher + tracker_backward_teacher)
-                            loss_mutual_consistency = masked_coordinate_loss(
-                                tracker_teacher,
-                                detector_student,
-                                consistency_weights,
-                                args,
-                            )
-                            consistency_weight_scale = 1.0
-                            if args.consistency_ramp_epochs > 0:
-                                ramp_progress = (epoch - args.cons_epoch + 1) / max(1, args.consistency_ramp_epochs)
-                                consistency_weight_scale = max(0.0, min(1.0, ramp_progress))
-                            if not torch.isnan(loss_mutual_consistency) and not torch.isinf(loss_mutual_consistency):
-                                loss += loss_mutual_consistency * args.mutual_consistency * consistency_weight_scale
-                else:
-                    if torch.isnan(loss_landmarks_init) or torch.isinf(loss_landmarks_init):
-                        logging.warning(f"NaN/Inf detected in loss_landmarks_init at epoch {epoch}")
-                        continue
-
-        # Backward pass
-        if is_training and not torch.isnan(loss):
-            scaler.scale(loss / grad_accum_steps).backward()
-            should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(data_loader))
-            if should_step:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                scaler.step(optimizer)
-                scaler.update()
-        
-        # Calculate prediction errors in millimetres (same metric for train & val).
-        # For training we only have ground-truth at the first/last frame; for
-        # validation every frame is annotated. Both branches produce errors in mm.
-        if is_training:
-            frame_indices = [0, -1]
-        else:
-            frame_indices = list(range(landmarks.shape[1]))
-
-        rx = float(rescale_x[0])
-        ry = float(rescale_y[0])
-
-        # Vectorised error over all frames / landmarks for sample 0 in the batch.
-        target_xy = landmarks[0, frame_indices]                              # [F, N, 2]
-        scale = torch.tensor([rx, ry], device=target_xy.device, dtype=target_xy.dtype)
-
-        def _pixel_err_mm_pair(pred_xy, target_xy):
-            diff = (pred_xy - target_xy) * scale                              # [F, N, 2] in original-image pixels
-            return (diff.pow(2).sum(dim=-1).sqrt() * spacing).detach().cpu().numpy()  # mm
-
-        def _pixel_err_mm(pred):
-            return _pixel_err_mm_pair(pred[0, frame_indices], target_xy)
-
-        err_init_matrix = _pixel_err_mm(spatial_init)               # [F, N]
-        endpoint_pred_indices = [0, -1] if spatial_init.shape[1] > 1 else [0]
-        endpoint_target_indices = [0, -1] if landmarks.shape[1] > 1 else [0]
-        err_detection_endpoint_matrix = _pixel_err_mm_pair(
-            spatial_init[0, endpoint_pred_indices],
-            landmarks[0, endpoint_target_indices],
-        )
-        if detector_only:
-            err_fwd_matrix = err_init_matrix
-            err_bwd_matrix = err_init_matrix
-        else:
-            err_fwd_matrix = _pixel_err_mm(pred_coords_forward)         # [F, N]
-            err_bwd_matrix = _pixel_err_mm(pred_coords_backward)        # [F, N]
-
-        # Keep the original naming semantics:
-        #   error_init        - errors of the global detector (spatial_init)
-        #   error_init_landmark - errors on the "seeding" end of each direction
-        #                         (forward at frame 0, backward at frame -1)
-        #   error_tracking_landmark - errors on the tracked-to end
-        #                         (forward at frame -1, backward at frame 0)
-        # For validation (all frames), aggregate forward/backward separately.
-        if is_training:
-            # Training reports both frames symmetrically
-            error_init = err_init_matrix.reshape(-1).tolist()
-            if detector_only:
-                error_init_landmark = error_init
-                error_tracking_landmark = error_init
-                full_sequence_tracking = error_init
-            else:
-                error_init_landmark = np.concatenate([
-                    err_fwd_matrix[0],      # forward seed @ frame 0
-                    err_bwd_matrix[-1],     # backward seed @ frame -1
-                ]).tolist()
-                error_tracking_landmark = np.concatenate([
-                    err_fwd_matrix[-1],     # forward tracked to frame -1
-                    err_bwd_matrix[0],      # backward tracked to frame 0
-                ]).tolist()
-                full_sequence_tracking = error_tracking_landmark
-        else:
-            # Validation reports across all frames
-            error_init = err_init_matrix.reshape(-1).tolist()
-            error_init_landmark = err_fwd_matrix.reshape(-1).tolist()
-            error_tracking_landmark = err_bwd_matrix.reshape(-1).tolist()
-            if detector_only:
-                full_sequence_tracking = error_init
-            else:
-                full_sequence_tracking = np.concatenate([
-                    err_fwd_matrix.reshape(-1),
-                    err_bwd_matrix.reshape(-1),
-                ]).tolist()
-
-        
-        # Update metrics
-        error_init_landmark_all.append(np.mean(error_init_landmark))
-        error_tracking_landmark_all.append(np.mean(error_tracking_landmark))
-        error_init_all.append(np.mean(error_init))
-        error_detection_endpoint_all.append(np.mean(err_detection_endpoint_matrix))
-        error_full_sequence_tracking_all.append(np.mean(full_sequence_tracking))
-        total_loss += loss.item()
-
-        # Update progress bar
-        pbar.set_postfix({
-            'loss_land': f'{loss_landmarks_init.item():.2f}',
-            'loss_cons': f'{loss_mutual_consistency.item():.2f}',
-            'loss_velo': f'{loss_velocity.item():.2f}',
-            'loss_track': f'{loss_tracking.item():.2f}',
-            'loss_track_sup': f'{loss_tracking_supervised.item():.2f}',
-            'err_init': f'{np.mean(error_init):.2f}',
-            'err_det_end': f'{np.mean(err_detection_endpoint_matrix):.2f}',
-            'full_seq': f'{np.mean(full_sequence_tracking):.2f}',
-            'err_init_t': f'{np.mean(error_init_landmark):.2f}',
-            'err_tracking': f'{np.mean(error_tracking_landmark):.2f}',
-        })
-        
-        total_loss_landmarks += loss_landmarks_init.item()
-        total_loss_consistency += loss_mutual_consistency.item()
-        total_loss_velocity += loss_velocity.item()
-        total_loss_tracking += loss_tracking.item()
-        total_loss_tracking_supervised += loss_tracking_supervised.item()
-        if consistency_mask_fraction is not None:
-            total_consistency_mask_fraction += consistency_mask_fraction.item()
-            consistency_mask_count += 1
-    # Calculate final metrics
-    metrics = {
-        'loss': total_loss / len(data_loader),
-        'loss_landmarks': total_loss_landmarks / len(data_loader),
-        'loss_consistency': total_loss_consistency / len(data_loader),
-        'loss_velocity': total_loss_velocity / len(data_loader),
-        'loss_tracking': total_loss_tracking / len(data_loader),
-        'loss_tracking_supervised': total_loss_tracking_supervised / len(data_loader),
-        'consistency_mask_fraction': (
-            total_consistency_mask_fraction / consistency_mask_count
-            if consistency_mask_count > 0 else 0.0
-        ),
-        'err_init_t': np.mean(error_init_landmark_all),
-        'err_tracking': np.mean(error_tracking_landmark_all),
-        'err_init': np.mean(error_init_all),
-        'err_detection_endpoint': np.mean(error_detection_endpoint_all),
-        'full_sequence_tracking': np.mean(error_full_sequence_tracking_all),
-    }
-    
-    # Log metrics
+    totals, errors = defaultdict(float), defaultdict(list)
+    sample_count = 0
+    detector_only = not is_training or args.training_mode == 'detector_only'
+    accum = args.grad_accum_steps if is_training else 1
     split = 'train' if is_training else 'val'
-    writer.add_scalar(f'Loss/{split}', metrics['loss'], epoch)
-    writer.add_scalar(f'Loss/{split}_landmarks', metrics['loss_landmarks'], epoch)
-    writer.add_scalar(f'Loss/{split}_consistency', metrics['loss_consistency'], epoch)
-    writer.add_scalar(f'Loss/{split}_velocity', metrics['loss_velocity'], epoch)
-    writer.add_scalar(f'Loss/{split}_tracking', metrics['loss_tracking'], epoch)
-    writer.add_scalar(f'Loss/{split}_tracking_supervised', metrics['loss_tracking_supervised'], epoch)
-    writer.add_scalar(f'Consistency/{split}_mask_fraction', metrics['consistency_mask_fraction'], epoch)
-    writer.add_scalar(f'Error/{split}_init', metrics['err_init'], epoch)
-    writer.add_scalar(f'Error/{split}_detection_endpoint', metrics['err_detection_endpoint'], epoch)
-    writer.add_scalar(f'Error/{split}_full_sequence_tracking', metrics['full_sequence_tracking'], epoch)
-    writer.add_scalar(f'Error/{split}_init_t', metrics['err_init_t'], epoch)
-    writer.add_scalar(f'Error/{split}_tracking', metrics['err_tracking'], epoch)
-    
-    logging.info(f'Epoch {epoch} {split.capitalize()} - '
-                f'Total Loss: {metrics["loss"]:.4f} - '
-                f'Landmarks: {metrics["loss_landmarks"]:.4f} - '
-                f'Consistency: {metrics["loss_consistency"]:.4f} - '
-                f'Velocity: {metrics["loss_velocity"]:.4f} - '
-                f'Tracking: {metrics["loss_tracking"]:.4f} - '
-                f'Tracking Supervised: {metrics["loss_tracking_supervised"]:.4f} - '
-                f'Consistency Mask: {metrics["consistency_mask_fraction"]:.4f} - '
-                f'Err Init: {metrics["err_init"]:.4f} - '
-                f'Err Detection Endpoint: {metrics["err_detection_endpoint"]:.4f} - '
-                f'Full Sequence Tracking: {metrics["full_sequence_tracking"]:.4f} - '
-                f'Err Init T: {metrics["err_init_t"]:.4f} - '
-                f'Err Tracking: {metrics["err_tracking"]:.4f}')
-    
+    progress = tqdm(data_loader, desc=f'{split} {epoch + 1}/{args.epochs}',
+                    disable=not sys.stderr.isatty(), mininterval=10)
+    for batch_index, batch in enumerate(progress):
+        if is_training and batch_index % accum == 0:
+            optimizer.zero_grad(set_to_none=True)
+            group_start = batch_index * data_loader.batch_size
+            group_samples = min(accum * data_loader.batch_size, len(data_loader.dataset) - group_start)
+        inputs = batch['video'].to(device, non_blocking=True).float()
+        landmarks = batch['landmarks'].to(device, non_blocking=True).float()
+        B, T, C, H, W = inputs.shape
+        extra_feature, cls_token = process_features(dinov2_model, inputs.reshape(B*T, C, H, W), B, T, H, W)
+        del inputs
+        with torch.set_grad_enabled(is_training):
+            amp_enabled = is_training and str(device).startswith('cuda') and args.precision != 'fp32'
+            with torch.autocast(device_type=torch.device(device).type, enabled=amp_enabled,
+                                dtype=torch.bfloat16 if args.precision == 'bf16' else torch.float16):
+                if detector_only:
+                    detector = model(extra_feature, cls_token, infer_mode=True)
+                else:
+                    seeds = landmarks[:, [0, -1]] / landmarks.new_tensor([W-1, H-1])
+                    forward, backward, forward_offsets, backward_offsets, detector = model(
+                        extra_feature, cls_token, tracker_seed_coords=seeds,
+                        detach_tracker_inputs=args.detach_tracker_inputs)
+            if not torch.isfinite(detector).all():
+                raise FloatingPointError(f'Non-finite detector output: epoch={epoch}, samples={batch["patient_name"]}')
+            losses = dict(landmarks=coordinate_loss(detector[:, 0], landmarks[:, 0])
+                                   + coordinate_loss(detector[:, -1], landmarks[:, -1]))
+            loss = losses['landmarks'] * args.endpoint_supervision_weight
+            if not detector_only:
+                losses['tracking_supervised'] = (coordinate_loss(forward[:, -1], landmarks[:, -1])
+                                                  + coordinate_loss(backward[:, 0], landmarks[:, 0]))
+                losses['tracking'] = coordinate_loss(forward[:, 1:-1], backward[:, 1:-1])
+                losses['velocity'] = velocity_consistency_loss(forward_offsets, backward_offsets)
+                loss = loss + losses['tracking_supervised'] * args.tracking_supervised
+                loss = loss + losses['tracking'] * args.tracking + losses['velocity'] * args.velocity
+                if epoch >= args.cons_epoch:
+                    fwd, bwd = forward[:, 1:-1], backward[:, 1:-1]
+                    if args.detach_tracker_teacher:
+                        fwd, bwd = fwd.detach(), bwd.detach()
+                    weights = tracker_agreement_weights(fwd, bwd, args)
+                    losses['consistency'] = co_training_loss(detector[:, 1:-1], fwd, bwd, weights, args)
+                    ramp = min(1., (epoch - args.cons_epoch + 1) / max(1, args.consistency_ramp_epochs))
+                    loss = loss + losses['consistency'] * args.mutual_consistency * ramp
+            losses['total'] = loss
+            if not all(torch.isfinite(value).item() for value in losses.values()):
+                raise FloatingPointError(f'Non-finite loss: epoch={epoch}, samples={batch["patient_name"]}, losses={losses}')
+            if is_training:
+                scaler.scale(loss * B / group_samples).backward()
+                if (batch_index + 1) % accum == 0 or batch_index + 1 == len(data_loader):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5., error_if_nonfinite=True)
+                    scaler.step(optimizer)
+                    scaler.update()
+        with torch.no_grad():
+            detector_error = prediction_errors_mm(labelled_predictions(detector, batch), landmarks, batch, args.data_type)
+            errors['err_init'].append(detector_error.cpu().numpy().reshape(-1))
+            errors['err_detection_endpoint'].append(detector_error[:, [0, -1]].cpu().numpy().reshape(-1))
+            if not detector_only:
+                tracked = torch.stack([backward[:, 0], forward[:, -1]], dim=1)
+                tracking_error = prediction_errors_mm(tracked, landmarks[:, [0, -1]], batch, args.data_type)
+                errors['err_tracking'].append(tracking_error.cpu().numpy().reshape(-1))
+        sample_count += B
+        for name, value in losses.items():
+            totals['loss' if name == 'total' else 'loss_' + name] += value.item() * B
+    metrics = {key: value / sample_count for key, value in totals.items()}
+    metrics.update({key: float(np.concatenate(value).mean()) for key, value in errors.items()})
+    metrics.setdefault('err_tracking', metrics['err_init'])
+    metrics['full_sequence_tracking'] = metrics['err_init']
+    metrics['videos'] = sample_count
+    metrics['reference_points'] = sum(len(value) for value in errors['err_init'])
+    if writer is not None:
+        for key, value in metrics.items():
+            writer.add_scalar(f'{split}/{key}', value, epoch)
+    logging.info('Epoch %d/%d %s: loss=%.4f detector MRE=%.4f mm endpoint MRE=%.4f mm videos=%d',
+                 epoch+1, args.epochs, split, metrics['loss'], metrics['err_init'],
+                 metrics['err_detection_endpoint'], sample_count)
     return metrics
 
 
@@ -571,221 +376,199 @@ def get_augmentations(args):
     }
 
 
-def main():
-    """Main training function"""
-    # Setup
-    args = parse_args()
-    if args.mode is not None:
-        args.training_mode = args.mode
-    if args.detector_only:
-        args.training_mode = 'detector_only'
-    seed = 33
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
+
+def seed_worker(worker_id):
+    seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(seed)
     random.seed(seed)
-    number_of_points = 11 if args.data_type == 'PLAX' else 3
-    
-    # Create run name and directory
-    tracker_cfg = ''
-    if args.training_mode != 'detector_only':
-        tracker_cfg = (
-            f"_tdetach{int(args.detach_tracker_teacher)}"
-            f"_tinpdetach{int(args.detach_tracker_inputs)}"
-            f"_gate{args.consistency_gate}{args.consistency_fb_threshold}"
-            f"_mnorm{args.consistency_mask_normalization}"
-            f"_epw{args.endpoint_supervision_weight}"
-        )
-    run_name = (f"bs{args.batch_size}_"
-                f"ep{args.epochs}_"
-                f"lr{args.lr}_"
-                f"mode{args.training_mode}_"
-                f"coord{args.coord_head}_"
-                f"graph{args.graph_mode}_"
-                f"aug{args.aug_mode}_"
-                f"rot{args.rotation_limit}p{args.rotation_prob}_"
-                f"wd{args.weight_decay}_"
-                f"warm{args.warmup_epochs}_"
-                f"cons{args.cons_epoch}_"
-                f"fr{args.frame_num}_"
-                f'agent{args.agent_num}_'
-                f'attn{args.attention_layers}_'
-                f'fbranch{args.feature_branch_mode}_'
-                f"sz{args.image_size[0]}x{args.image_size[1]}_"
-                f"velocity{args.velocity}_"
-                f"tracking{args.tracking}_"
-                f"mutual{args.mutual_consistency}"
-                f"{tracker_cfg}")
-    if args.run_tag is not None:
-        run_name = args.run_tag
-    results_dir = os.path.join(f'./results/{args.data_type}', run_name)
-    # Snapshot the current code folder for reproducibility.
-    # Use an absolute path anchored to this file so it works regardless of cwd.
-    code_src = os.path.dirname(os.path.abspath(__file__))
-    code_dst = os.path.join(results_dir, 'code')
-    if os.path.exists(code_dst):
-        shutil.rmtree(code_dst)
-    shutil.copytree(code_src, code_dst)
-    # Setup logging and tensorboard
-    setup_logging(results_dir)
-    writer = SummaryWriter(log_dir=results_dir)
-    logging.info(f'Starting training with arguments: {args}')
-    
-    # Setup data
-    aug = get_augmentations(args)
-    train_dataset = EchoDataset(root_dir=args.data_dir, transform=aug['train'],
-                               splits='train', frame_num=args.frame_num,
-                               target_size=args.image_size, data_type=args.data_type,
-                               rotation_limit=args.rotation_limit,
-                               rotation_prob=args.rotation_prob)
-    val_dataset = EchoDataset(root_dir=args.data_dir, transform=aug['val'],
-                             splits='val', frame_num=args.frame_num,
-                             target_size=args.image_size, data_type=args.data_type)
-    
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size,
-                            shuffle=True, num_workers=args.num_workers,
-                            pin_memory=True,
-                            drop_last=True,
-                            persistent_workers=args.num_workers > 0,
-                            prefetch_factor=4 if args.num_workers > 0 else None)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False,
-                          num_workers=max(1, args.num_workers // 2),
-                          pin_memory=True,
-                          persistent_workers=args.num_workers > 0)
-    
-    # Setup models
-    model = SemiEchoTracker(
-        agent_num=args.agent_num,
-        nodes_num=number_of_points,
-        image_size=args.image_size[0],
-        coord_head=args.coord_head,
-        graph_mode=args.graph_mode,
-        attention_layers=args.attention_layers,
-        feature_branch_mode=args.feature_branch_mode,
-    ).to(args.device)
-    logging.info('start loading dinov2 model...')
-    dinov2_model = get_dinov2_model().to(args.device)
-    logging.info('dinov2 model loaded')
-    
-    # Freeze DINOv2 model
-    dinov2_model.eval()
-    for param in dinov2_model.parameters():
-        param.requires_grad = False
-    
-    # Setup optimizer - remove dinov2_model parameters since they're frozen.
+    import cv2
+    cv2.setNumThreads(1)
+
+
+def make_model(args):
+    return SemiEchoTracker(agent_num=args.agent_num, nodes_num=11 if args.data_type == 'PLAX' else 3,
+                           image_size=args.image_size[0], coord_head=args.coord_head,
+                           graph_mode=args.graph_mode, attention_layers=args.attention_layers,
+                           feature_branch_mode=args.feature_branch_mode)
+
+
+def load_backbone(args):
+    return get_dinov2_model(source=args.backbone_source, hub_dir=args.backbone_repo,
+                           checkpoint=args.backbone_checkpoint, device=args.device)
+
+
+def make_optimizer(model, args):
     detector_params, tracker_params = [], []
-    for name, param in model.named_parameters():
-        if is_tracker_parameter(name):
-            tracker_params.append(param)
-        else:
-            detector_params.append(param)
-    optimizer = optim.AdamW(
-        [
-            {
-                'params': detector_params,
-                'lr': args.lr * args.detector_lr_multiplier,
-                'name': 'detector_shared',
-            },
-            {
-                'params': tracker_params,
-                'lr': args.lr * args.tracker_lr_multiplier,
-                'name': 'tracker',
-            },
-        ],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    logging.info(
-        f'Optimizer lr groups: detector_shared={args.lr * args.detector_lr_multiplier:.6g}, '
-        f'tracker={args.lr * args.tracker_lr_multiplier:.6g}'
-    )
-    
-    if args.warmup_epochs > 0 and args.epochs > args.warmup_epochs:
-        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
-                                  total_iters=args.warmup_epochs)
-        main_scheduler = CosineAnnealingLR(optimizer,
-                                          T_max=max(1, args.epochs - args.warmup_epochs))
-        scheduler = SequentialLR(optimizer,
-                               schedulers=[warmup_scheduler, main_scheduler],
-                               milestones=[args.warmup_epochs])
-    elif args.warmup_epochs > 0:
-        scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
-                             total_iters=max(1, args.epochs))
+    for name, parameter in model.named_parameters():
+        (tracker_params if is_tracker_parameter(name) else detector_params).append(parameter)
+    optimizer_class = optim.Adam if args.optimizer == 'adam' else optim.AdamW
+    return optimizer_class([
+        dict(params=detector_params, lr=args.lr * args.detector_lr_multiplier, name='detector_shared'),
+        dict(params=tracker_params, lr=args.lr * args.tracker_lr_multiplier, name='tracker'),
+    ], lr=args.lr, weight_decay=args.weight_decay)
+
+
+def file_sha(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def backbone_code_hash(path):
+    if path is None:
+        return None
+    root = Path(path)
+    digest = hashlib.sha256()
+    for source in sorted(root.rglob('*.py')):
+        digest.update(str(source.relative_to(root)).encode())
+        digest.update(source.read_bytes())
+    return digest.hexdigest()
+
+
+def source_files(root):
+    # 显式白名单，避免递归包含 results、权重、虚拟环境及数据。
+    files = list(root.glob('*.py'))
+    for directory in ('models', 'dataset', 'tests'):
+        files.extend((root / directory).rglob('*.py'))
+    return sorted(files)
+
+
+def atomic_checkpoint(checkpoint, path):
+    temporary = path.with_suffix('.tmp')
+    torch.save(checkpoint, temporary)
+    temporary.replace(path)
+
+
+def rng_state(generator):
+    return dict(python=random.getstate(), numpy=np.random.get_state(), torch=torch.get_rng_state(),
+                cuda=torch.cuda.get_rng_state_all(), loader=generator.get_state())
+
+
+def restore_rng(state, generator):
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    torch.cuda.set_rng_state_all(state['cuda'])
+    generator.set_state(state['loader'])
+
+
+def main():
+    args = parse_args()
+    seed_everything(args.seed)
+    root = Path(__file__).resolve().parent
+    results = root / 'results' / args.data_type / (args.run_tag or f'seed{args.seed}_{args.training_mode}')
+    if args.resume is None and results.exists() and any(results.iterdir()):
+        raise FileExistsError(f'Run already exists; use --resume explicitly: {results}')
+    results.mkdir(parents=True, exist_ok=True)
+    setup_logging(results)
+    logging.info('Arguments: %s', vars(args))
+    aug = get_augmentations(args)
+    train_dataset = make_dataset(root_dir=args.data_dir, transform=aug['train'], splits='train',
+                                 frame_num=args.frame_num, target_size=args.image_size, data_type=args.data_type,
+                                 rotation_limit=args.rotation_limit, rotation_prob=args.rotation_prob)
+    val_dataset = make_dataset(root_dir=args.data_dir, transform=aug['val'], splits='val',
+                               frame_num=args.frame_num, target_size=args.image_size, data_type=args.data_type)
+    generator = torch.Generator().manual_seed(args.seed)
+    loader_args = dict(batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True,
+                       worker_init_fn=seed_worker, generator=generator,
+                       prefetch_factor=2 if args.num_workers else None, persistent_workers=False)
+    train_loader = DataLoader(train_dataset, shuffle=True, drop_last=False, **loader_args)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_args)
+    model = make_model(args).to(args.device)
+    backbone = load_backbone(args)
+    optimizer = make_optimizer(model, args)
+    if 0 < args.warmup_epochs < args.epochs:
+        scheduler = SequentialLR(optimizer, [
+            LinearLR(optimizer, start_factor=.1, total_iters=args.warmup_epochs),
+            CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs),
+        ], milestones=[args.warmup_epochs])
+    elif args.warmup_epochs:
+        scheduler = LinearLR(optimizer, start_factor=.1, total_iters=args.epochs)
     else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
-    
-    # Setup mixed precision training
-    scaler = torch.amp.GradScaler('cuda')
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    logging.info(f'Trainable parameters: {trainable_params}/{total_params}')
-    best_val_error = float('inf')
-    best_save_name = None
-    best_records = {
-        'endpoint': {'value': float('inf'), 'filename': None, 'alias': 'best_endpoint_model.pth'},
-        'detector_fullseq': {'value': float('inf'), 'filename': None, 'alias': 'best_detector_fullseq_model.pth'},
-    }
-    # Training loop
-    for epoch in range(args.epochs):
-        train_metrics = train(model, dinov2_model, train_loader, optimizer,
-                            args.device, epoch, writer, scaler, args)
-        val_metrics = validate(model, dinov2_model, val_loader,
-                             args.device, epoch, writer, args)
-        
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
-        logging.info(f'Epoch {epoch}/{args.epochs} finished, LR: {current_lr:.6f}')
-        
-        # Save checkpoints (DINOv2 is frozen, no need to save it every epoch)
-        checkpoint = {
-            'epoch': epoch,
-            'args': vars(args),
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'train_metrics': train_metrics,
-            'val_metrics': val_metrics,
-        }
-
-        # Save latest model
-        torch.save(checkpoint, os.path.join(results_dir, 'latest_model.pth'))
-
-        # Save best model. Detector-only baselines are selected by endpoint
-        # detection because that is the supervised detection metric.
-        best_metric_name = args.best_metric
-        if best_metric_name is None:
-            best_metric_name = 'err_detection_endpoint' if args.training_mode == 'detector_only' else 'err_init'
-        avg_error = val_metrics[best_metric_name]
-        if avg_error < best_val_error:
-            if best_save_name is not None:
-                prev_path = os.path.join(results_dir, best_save_name)
-                if os.path.exists(prev_path):
-                    os.remove(prev_path)
-            best_val_error = avg_error
-            best_save_name = f'best_model_{best_val_error:.4f}_epoch{epoch}.pth'
-            torch.save(checkpoint, os.path.join(results_dir, best_save_name))
-            torch.save(checkpoint, os.path.join(results_dir, 'best_model.pth'))
-            logging.info(f'Best model saved by {best_metric_name}: {best_val_error:.4f}')
-
-        auxiliary_scores = {
-            'endpoint': val_metrics['err_detection_endpoint'],
-            'detector_fullseq': val_metrics['err_init'],
-        }
-        for label, score in auxiliary_scores.items():
-            record = best_records[label]
-            if score < record['value']:
-                if record['filename'] is not None:
-                    prev_path = os.path.join(results_dir, record['filename'])
-                    if os.path.exists(prev_path):
-                        os.remove(prev_path)
-                record['value'] = score
-                record['filename'] = f'best_{label}_{score:.4f}_epoch{epoch}.pth'
-                torch.save(checkpoint, os.path.join(results_dir, record['filename']))
-                torch.save(checkpoint, os.path.join(results_dir, record['alias']))
-                logging.info(f'Aux best {label} saved: {score:.4f}')
-    
-    writer.close()
-    logging.info('Training completed.')
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = torch.amp.GradScaler('cuda', init_scale=1024,
+                                 enabled=str(args.device).startswith('cuda') and args.precision == 'fp16')
+    sources = {str(path.relative_to(root)): file_sha(path) for path in source_files(root)}
+    provenance = dict(code_commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
+                      source_sha256=sources, data_manifest_sha256=getattr(train_dataset, 'manifest_sha256', None),
+                      backbone_sha256=file_sha(args.backbone_checkpoint) if args.backbone_checkpoint else None,
+                      backbone_code_sha256=backbone_code_hash(args.backbone_repo),
+                      backbone_repo=args.backbone_repo, command=sys.argv,
+                      python=platform.python_version(), torch=torch.__version__, cuda=torch.version.cuda,
+                      cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
+                      gpu=torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+                      effective_batch_size=args.batch_size * args.grad_accum_steps,
+                      train_videos=len(train_dataset), val_videos=len(val_dataset))
+    start_epoch, best_value, best_epoch = 0, float('inf'), None
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        previous_args = checkpoint['args']
+        for key, value in vars(args).items():
+            if key != 'resume' and value != previous_args[key]:
+                raise ValueError(f'Resume configuration mismatch: {key}')
+        for key in ('source_sha256', 'data_manifest_sha256', 'backbone_sha256', 'backbone_code_sha256'):
+            if provenance[key] != checkpoint['provenance'][key]:
+                raise ValueError(f'Resume provenance mismatch: {key}')
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        restore_rng(checkpoint['rng_state'], generator)
+        start_epoch = checkpoint['epoch'] + 1
+        best_value, best_epoch = checkpoint['best_value'], checkpoint['best_epoch']
+        logging.info('Resuming epoch %d', start_epoch + 1)
+    else:
+        for source in source_files(root) + [root / 'README.md']:
+            destination = results / 'code' / source.relative_to(root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        (results / 'config.json').write_text(json.dumps(vars(args), indent=2) + '\n')
+        (results / 'provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')
+        packages = sorted(f'{dist.metadata["Name"]}=={dist.version}' for dist in distributions())
+        (results / 'environment.txt').write_text('\n'.join(packages) + '\n')
+        if hasattr(train_dataset, 'manifest_path'):
+            shutil.copy2(train_dataset.manifest_path, results / 'data_manifest.json')
+    writer = SummaryWriter(log_dir=str(results / 'tensorboard'))
+    best_metric = args.best_metric or ('err_detection_endpoint' if args.training_mode == 'detector_only' else 'err_init')
+    logging.info('Training starts: %d parameters; effective batch=%d; precision=%s; select by %s',
+                 sum(p.numel() for p in model.parameters()), provenance['effective_batch_size'], args.precision, best_metric)
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            started = time.monotonic()
+            learning_rate = scheduler.get_last_lr()[0]
+            train_metrics = train(model, backbone, train_loader, optimizer, args.device, epoch, writer, scaler, args)
+            val_metrics = validate(model, backbone, val_loader, args.device, epoch, writer, args)
+            scheduler.step()
+            improved = val_metrics[best_metric] < best_value
+            if improved:
+                best_value, best_epoch = val_metrics[best_metric], epoch
+            checkpoint = dict(epoch=epoch, args=vars(args), provenance=provenance,
+                              model_state_dict=model.state_dict(), optimizer_state_dict=optimizer.state_dict(),
+                              scheduler_state_dict=scheduler.state_dict(), scaler_state_dict=scaler.state_dict(),
+                              rng_state=rng_state(generator), train_metrics=train_metrics, val_metrics=val_metrics,
+                              best_value=best_value, best_epoch=best_epoch, best_metric=best_metric)
+            atomic_checkpoint(checkpoint, results / 'latest_model.pth')
+            if improved:
+                atomic_checkpoint(checkpoint, results / 'best_model.pth')
+                logging.info('Best detector checkpoint: epoch=%d MRE=%.4f mm', epoch+1, best_value)
+            with (results / 'metrics.jsonl').open('a') as stream:
+                stream.write(json.dumps(dict(epoch=epoch+1, learning_rate=learning_rate,
+                                             seconds=time.monotonic()-started, train=train_metrics, val=val_metrics),
+                                        allow_nan=False) + '\n')
+            writer.flush()
+        logging.info('Training completed: %d epochs; best epoch=%d, MRE=%.4f mm', args.epochs, best_epoch+1, best_value)
+    finally:
+        writer.close()
 
 
 if __name__ == '__main__':

@@ -165,15 +165,16 @@ train_set = MyEchoDataset(root="data/custom", split="train")
 val_set   = MyEchoDataset(root="data/custom", split="val")
 
 dataloaders  = {
-    "train": DataLoader(train_set, batch_size=4, shuffle=True,  num_workers=4),
-    "val":   DataLoader(val_set,   batch_size=4, shuffle=False, num_workers=4),
+    "train": DataLoader(train_set, batch_size=1, shuffle=True,  num_workers=4),
+    "val":   DataLoader(val_set,   batch_size=1, shuffle=False, num_workers=4),
 }
 dataset_size = {"train": len(train_set), "val": len(val_set)}
 
 # ------------------------------------------------------------------
 # 2. Instantiate and train
 # ------------------------------------------------------------------
-model = ECHOTRACKER2(device_ids=[0])
+model = ECHOTRACKER2(device_ids=[0], sp_attn=True,
+                    resnet_temp_module=True, patch_size=9)
 
 model.train(
     dataloaders=dataloaders,
@@ -181,20 +182,22 @@ model.train(
     log_dir="outputs/logs/echotracker2",
     ckpt_path="weights/echotracker2_custom",
     epochs=50,
+    accumulation_steps=4,
     q_frame=0,   # 0 = track forward from first frame
                  # -1 = use 75% frame, -2 = random frame each batch
 )
 ```
 
-Checkpoints are saved automatically under `ckpt_path/val/` (best loss) and `ckpt_path/val/best_davg/` (best average positional accuracy). TensorBoard logs are written to `log_dir`.
+本地 EchoTracker2 训练入口使用单 GPU、单视频 micro-batch，避免发布实现把不同视频混入时间和点邻域；通过 `accumulation_steps` 调整有效批量。四次细化结果共同参与损失。检查点保存为 `ckpt_path/best.pth`、`ckpt_path/latest.pth`，原生训练和验证指标保存到 `log_dir/history.jsonl`。最佳模型按验证集 L1 `<δavg(1,2,4)` 选择，平局取 MTE 更低者。
 
 ### Fine-tuning from pretrained weights
 
-Pass `ft_model=True` so the loader reads the checkpoint with flexible key matching, then call `load(..., eval=False)` before training:
+设置发布模型的结构参数，并在训练前调用 `load(..., eval=False)`。加载仅允许已核实的四个发布权重额外投影键，其余键和尺寸严格匹配：
 
 ```python
-model = ECHOTRACKER2(device_ids=[0], ft_model=True)
-model.load(path="weights/echotracker2/checkpoint.pth", eval=False)
+model = ECHOTRACKER2(device_ids=[0], ft_model=True, sp_attn=True,
+                    resnet_temp_module=True, patch_size=9)
+model.load(path="weights/echotracker2/model-0.pth", eval=False)
 
 model.train(
     dataloaders=dataloaders,
@@ -202,8 +205,53 @@ model.train(
     log_dir="outputs/logs/echotracker2_ft",
     ckpt_path="weights/echotracker2_ft",
     epochs=20,
+    accumulation_steps=4,
+    lr=5e-5,
 )
 ```
+
+## EchoXFlow A4C 后训练
+
+本轮实验的数据处理、划分、论文评估口径和完整结果见 [实验结果讲解报告](outputs/echoxflow_a4c/RESULTS_zh.md)。
+
+工作目录：`/root/ultrasound/EchoTracker2`。配置入口为 `echoxflow_a4c.json`，物理 GPU 1 通过 UUID 绑定，进程内映射为 `cuda:0`。准备阶段复用 `../m2p/.venv-data` 的 Python 3.13 与固定版本官方扫描转换源码；训练和评测使用本目录 `.venv` 的 Python 3.11 / PyTorch 2.5.1。
+
+```bash
+# 从共享原始库核验、扫描转换并准备 A4C 缓存。
+../m2p/.venv-data/bin/python -B echoxflow.py prepare
+
+# 原始权重和静止点基线。
+.venv/bin/python -B echoxflow.py evaluate --model pretrained static
+
+# 单种子 20 轮后训练；验证集选择最佳权重。
+.venv/bin/python -B echoxflow.py train
+
+# 在固定测试集评测最佳后训练权重。
+.venv/bin/python -B echoxflow.py evaluate --model finetuned
+
+# 从最近完成的一轮继续，配置和源码必须一致。
+.venv/bin/python -B echoxflow.py train --resume outputs/echoxflow_a4c/checkpoints/latest.pth
+```
+
+数据固定为 `Ahus-AIM/EchoXFlow@d907c536cae16750b9e46f269a27befd4979ebdd`，从 `../data/echoxflow/raw` 读取。按官方关联和视频内容哈希去重，重复标注按标注记录 ID、视频记录 ID 排序选择。291 段明确配对的 A4C 按官方 0–2/3/4 折分为 163/64/64 段训练、验证、测试视频；77 条未解析的多平面链接排除，历史 ED/ES 筛选不参与本实验。
+
+图像与米制轮廓使用同一正方形物理视野，转换至 256×256，像素中心范围为 0–255。轮廓取中层 `2::5` 并保留沿壁顺序。时间匹配容差为半个视频帧间隔加 1 微秒，冲突取误差最小者；未匹配帧、非有限坐标和扇区外参考点由掩码排除，不插值补标签。准备缓存保存源数组哈希、几何和帧关联，配置不匹配须重新准备。
+
+训练使用随机连续片段 `min(36,T)`、最多40个有效查询点、随机查询帧、各0.5概率的水平翻转和时间反转。全参数 FP32、micro-batch=1、累积4次梯度、种子20261013；AdamW 峰值学习率 `5e-5`、weight decay `1e-6`、OneCycleLR 按实际优化器更新次数调度，四次 masked L1 损失权重为 `0.8^(3-i)/4`。每轮验证，以 L1 三阈值均值最高者保存最佳权重，平局时取 L1 MTE 更低者；测试集不参与选择。本轮不包含论文的 impartial motion 增强。
+
+论文中的 iTSM 对应 `ResNet_echo2/ExtraConvs_echo2`；9×9 三尺度 4D 相关对应 `joint_refine/CMDTop`；`KNPTransformer` 在发布代码中按点索引邻域进行空间注意力，并非显式几何 kNN。模型可通过 `return_iterations=True` 返回 `iterations[4,B,N,T,2]`，默认最终 `tracks[B,N,T,2]` 接口保持兼容。
+
+评测从首个匹配帧的有效中层点查询，追踪整个标注覆盖区间，排除查询帧和无效参考位置。主指标使用 L1 距离、严格小于1/2/4像素的百分比及其均值；MTE 为每点时间误差中位数的点均值，再对视频等权平均。辅助 L2 指标明确区分三阈值和五阈值均值。指标均描述与软件参考轨迹的一致性，不提供独立组织点真值或临床 GLS 精度证明。
+
+派生数据、指标、测试预测和检查点集中在 `outputs/echoxflow_a4c/`：
+
+- `prepared/manifest.json` 和 `prepared/sequences/`：数据来源、固定划分、像素轨迹和有效掩码。
+- `config.json`、`runtime_*.json`、`source/`、`commands.log`：实际配置、代码与权重哈希、源码、环境和命令。
+- `training/history.jsonl`、`checkpoints/best.pth`、`checkpoints/latest.pth`：每轮指标及模型、优化器、调度器和随机状态。
+- `evaluation/test/{pretrained,finetuned,static}/`：原生指标、逐视频 CSV 和预测坐标。
+- `evaluation/test/paired_bootstrap.json`：配对差值、按检查分组的置信区间、改善与退化视频数及统计输入哈希。
+
+已知风险的回归检查：`.venv/bin/python -B -m unittest discover -s tests -v`。配对统计按检查 ID 分组，对相同测试视频的后训练与原始权重指标之差进行2000次 bootstrap 重采样，使用种子20261013及百分位95%置信区间；每次抽取检查后纳入其全部视频，继续按视频等权计算。统计在实验分析时直接计算，不另设固定报告生成入口。
 
 ---
  

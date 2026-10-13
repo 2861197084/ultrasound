@@ -34,23 +34,29 @@ def _resolve_pretrain_dir():
     )
 
 
-def get_dinov2_model():
-    hub_dir = _resolve_pretrain_dir()
-    ckpt_path = os.path.join(hub_dir, 'teacher_checkpoint.pth')
+def get_dinov2_model(source='guided', hub_dir=None, checkpoint=None, device='cpu'):
+    if source not in ('guided', 'public'):
+        raise ValueError(f'Unsupported DINOv2 source: {source}')
+    if source == 'public' and (hub_dir is None or checkpoint is None):
+        raise ValueError('Public DINOv2 requires explicit hub_dir and checkpoint')
+    hub_dir = hub_dir or _resolve_pretrain_dir()
+    ckpt_path = checkpoint or os.path.join(hub_dir, 'teacher_checkpoint.pth')
 
     if not os.path.isdir(hub_dir):
         raise FileNotFoundError(f'DINOv2 hub directory not found: {hub_dir}')
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f'DINOv2 teacher checkpoint not found: {ckpt_path}')
 
-    model_guided = torch.hub.load(hub_dir, 'dinov2_vits14', source='local').cuda()
-    pretrained = torch.load(ckpt_path, weights_only=True)
-    new_state_dict = {}
-    for key, value in pretrained['teacher'].items():
-        if 'dino_head' in key:
-            continue
-        new_state_dict[key.replace('backbone.', '')] = value
-    model_guided.pos_embed = nn.Parameter(torch.zeros(1, 257, 384))
-    model_guided.load_state_dict(new_state_dict, strict=True)
-    print(f'DINOv2 loaded from {ckpt_path}')
-    return model_guided
+    model = torch.hub.load(hub_dir, 'dinov2_vits14', source='local', pretrained=False)
+    pretrained = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+    if source == 'guided':
+        state = {key.removeprefix('backbone.'): value for key, value in pretrained['teacher'].items()
+                 if not key.startswith(('dino_head.', 'ibot_head.'))}
+        model.pos_embed = nn.Parameter(torch.zeros_like(state['pos_embed']))
+    else:
+        state = pretrained
+    model.load_state_dict(state, strict=True)
+    model.requires_grad_(False)
+    model.eval()
+    print(f'DINOv2 ({source}) loaded strictly from {ckpt_path}')
+    return model.to(device)

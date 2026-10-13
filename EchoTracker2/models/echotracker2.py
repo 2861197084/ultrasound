@@ -166,6 +166,7 @@ class EchoTracker2(nn.Module):
       query_points: torch.Tensor,
       is_training: bool = False,
       query_chunk_size: int = 64,
+      return_iterations: bool = False,
       #refinement_resolutions: Optional[List[Tuple[int, int]]] = None,
   ) -> Dict[str, torch.Tensor]:
     """Runs a forward pass of the model.
@@ -176,6 +177,8 @@ class EchoTracker2(nn.Module):
       is_training: Whether we are training.
       query_chunk_size: When computing cost volumes, break the queries into
         chunks of this size to save memory.
+      return_iterations: Also return all four refinement predictions as
+        iterations [4, batch, num_queries, num_frames, 2] for sequence loss.
       get_query_feats: Return query features for other losses like contrastive.
         Not supported in the current version.
       refinement_resolutions: A list of (height, width) tuples.  Refinement will
@@ -235,6 +238,8 @@ class EchoTracker2(nn.Module):
         # unrefined_tracks=trajectories['tracks'][:-1],
         # unrefined_expected_dist=trajectories['expected_dist'][:-1],
     )
+    if return_iterations:
+      out['iterations'] = torch.stack(trajectories['tracks'], dim=0)
     #query_points = query_points[..., [0, 2, 1]] #(t, y, x) -> (t, x, y)
     return out
 

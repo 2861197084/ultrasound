@@ -12,6 +12,10 @@ from utils import saverloader
 from tqdm import tqdm
 from utils import evaluate
 import os
+import json
+import math
+from pathlib import Path
+import time
 from torch.utils.tensorboard import SummaryWriter
 from models.cotracker.model_utils import get_points_on_a_grid
 
@@ -48,212 +52,157 @@ class ECHOTRACKER2():
         ).to(self.device)
 
     def load(self, path=None, eval=True):
-        """ load the model with a given trained weigth for training or inferencing
-
-        Args:
-            path (str): path to folder containing the trained weight
-            eval (bool, optional): False if the model is loaded for training. Defaults to True.
-
-        Returns:
-            model: a loaded model with train or eval mode activated
-        """
-        if path is not None and self.ft_model:
-            _ = saverloader.load(path, self.model)
-            #_ = saverloader.load(path, self.model, ignore_load='torch_pips_mixer')
-        elif path is not None:
-            with open(path, "rb") as f:
-                #state_dict = torch.load(f, map_location="cpu")
-                state_dict = torch.load(f)['state_dict']
-                state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
-            self.model.load_state_dict(state_dict)
-            #self.model.load_state_dict(torch.load(path, map_location="cpu"))
-        
-        if eval:
-            requires_grad(self.model.parameters(), False)
-            print("The EchoTracker2 model is loaded for evaluation.")
-            return self.model.eval()
-        else:
-            self.model = torch.nn.DataParallel(self.model, device_ids=self.device_ids)
-            requires_grad(self.model.parameters(), True)
-            print("The EchoTracker2 model is loaded for training.")
-            return self.model.train()   
+        """加载明确文件或原始 checkpoint 目录；训练使用独立视频单 GPU。"""
+        if path is not None:
+            saverloader.load_echo_checkpoint(path, self.model)
+        requires_grad(self.model.parameters(), not eval)
+        return self.model.eval() if eval else self.model.train()
 
     def infer(self, video, points, resize=None):
-        """Run the model on the video for the given points in 1st frame and return the results.
-
-        Args:
-            video (tensor): a sequence of frames of shape [B, S, H, W, C]
-            points (tensor): a list of points across different timesteps [B, N, 3]->(t, x, y). range: [0.0 - 1.0]
-            resize (tuple): (H, W)
-        Returns:
-            trajs_e (tensor): Estimated trajectory of points through the video [B, N, S, 2]
-        """
-        rgbs = video.float().to(self.device)
-        #rgbs = (2 * (rgbs / 255.0) - 1.0)
-        
-        B, S, H, W, C = video.shape
+        """输入 RGB [B,T,H,W,C]、归一化 (t,x,y)，输出 [B,N,T,2]。"""
+        rgbs = video.to(self.device, dtype=torch.float32)
+        B, S, H, W, C = rgbs.shape
+        if B != 1:
+            raise ValueError("EchoTracker2 temporal/point neighborhoods require batch size 1")
         if resize is not None:
-            rgbs_ = rgbs.permute(0, 1, 4, 2, 3).reshape(B*S, C, H, W)
-            H_, W_ = resize[0], resize[1]
-            rgbs_ = F.interpolate(rgbs_, (H_, W_), mode='bilinear')
-            H, W = H_, W_
-            rgbs = rgbs_.reshape(B, S, C, H, W).permute(0, 1, 3, 4, 2)
-        
-
-        points[...,1] *= W - 1
-        points[...,2] *= H - 1
-        query_points = points.to(self.device)
-        
-        # #if not self.ft_model:
-        query_points = query_points[..., [0, 2, 1]] #(t, x, y) -> (t, y, x)
-
-        
+            H, W = resize
+            rgbs = F.interpolate(rgbs.permute(0, 1, 4, 2, 3).reshape(B*S, C, *rgbs.shape[2:4]),
+                                 (H, W), mode='bilinear', align_corners=False)
+            rgbs = rgbs.reshape(B, S, C, H, W).permute(0, 1, 3, 4, 2)
+        query = points.to(self.device, dtype=torch.float32).clone()
+        query[..., 1:] *= query.new_tensor([W - 1, H - 1])
         with torch.no_grad():
-            torch.cuda.empty_cache()
-            # outputs, _ = self.model(rgbs, query_points)
-            # print(rgbs.shape, query_points.shape)
-            # raise KeyboardInterrupt
-            outputs = self.model(rgbs, query_points)
+            output = self.model(rgbs, query[..., [0, 2, 1]])['tracks']
+        return output / output.new_tensor([W - 1, H - 1])
 
-        trajs_e = outputs['tracks']
-        
-        trajs_e[...,0] /= W - 1
-        trajs_e[...,1] /= H - 1
-        
-        points[...,1] /= W - 1
-        points[...,2] /= H -1
+    def supervised_loss(self, rgbs, trajectories, valid, q_frame=-2,
+                        max_points=40, gamma=0.8):
+        """保持时间与点维度独立，对四次细化结果进行 masked L1 监督。"""
+        rgbs = rgbs.to(self.device, dtype=torch.float32)
+        trajectories = trajectories.to(self.device, dtype=torch.float32)
+        valid = valid.to(self.device, dtype=torch.bool)
+        B, T, H, W, C = rgbs.shape
+        if B != 1 or trajectories.shape != (B, T, valid.shape[-1], 2) or valid.shape[:2] != (B, T):
+            raise ValueError("Expected one video [1,T,H,W,C], [1,T,N,2], [1,T,N]")
+        multiple_frames = valid[0].sum(0) > 1
+        if q_frame == -2:
+            eligible_frames = torch.where((valid[0] & multiple_frames).any(-1))[0]
+            if not len(eligible_frames):
+                raise ValueError("No valid query with another supervised position")
+            q_frame = int(eligible_frames[torch.randint(len(eligible_frames), (1,), device=self.device)].item())
+        elif q_frame == -1:
+            q_frame = int(T * .75)
+        if not 0 <= q_frame < T:
+            raise ValueError("Query frame outside the clip")
+        ids = torch.where(valid[0, q_frame] & multiple_frames)[0]
+        if not len(ids):
+            raise ValueError("No valid query points")
+        if max_points is not None and len(ids) > max_points:
+            ids = ids[torch.randperm(len(ids), device=self.device)[:max_points]].sort().values
+        target = trajectories[:, :, ids] * trajectories.new_tensor([W - 1, H - 1])
+        mask = valid[:, :, ids]
+        target = torch.where(mask[..., None], target, 0.0)
+        query = torch.zeros((B, len(ids), 3), device=self.device)
+        query[..., 0] = q_frame
+        query[..., 1:] = target[:, q_frame, :, [1, 0]]
+        output = self.model(rgbs, query, return_iterations=True)
+        predictions = [p.permute(0, 2, 1, 3) for p in output['iterations']]
+        return sequence_loss(predictions, target, mask, mask, gamma).mean()
 
-        return trajs_e
-    
-    
-    def train(self, dataloaders, dataset_size, log_dir, ckpt_path, epochs=10, q_frame=0):        
-        """ Train the model on the provided dataset.
-        Args:
-            dataloaders (Dict): {'train':torch train dataloader, 'val':torch train dataloader}
-            dataset_size (Dict): {'train': int, 'val':int}
-            epoch (int, optional): number of epochs to train. Defaults to 10.
-
-        Returns:
-            _type_: _description_
-        """
-        lr = 5e-4
-        weight_decay = 1e-6
-        steps_per_epoch = dataset_size['train']
-        optimizer, scheduler = fetch_optimizer(
-            lr, weight_decay, 1e-8, epochs, steps_per_epoch, self.model.parameters()
-        )
-        # metrics = getMetricsDict()
-        # metrics['loss'] = 0.0
-        best_loss = float('inf')
-        best_davg = 0.0
-        
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-        writer = SummaryWriter(log_dir=log_dir)
-        
-        for epoch in tqdm(range(epochs)):
-            # Each epoch has a training and validation phase
-            for phase in ['train', 'val']:
-                if phase == "train":
-                    self.model.train()
-                else:
-                    self.model.eval()
-                
-                # Reset batch metrics
-                epoch_metrics = getMetricsDict()
-                epoch_metrics['loss'] = 0.0
-                total_batches = 0  # To keep track of batches in each phase
-
-                for rgbs, trajs_g, visibs_g in dataloaders[phase]:
-                    rgbs = rgbs.float().to(self.device)  # [B, T, H, W, C]
-                    #rgbs = (2 * (rgbs / 255.0) - 1.0) # normalizing [-1 1]
-                    trajs_g = trajs_g.permute(0, 2, 1, 3).to(self.device)  # [B, N, T, 2]
-                    visibs_g = visibs_g.to(self.device)  # [B, T, N]
-                    
-                    # Normalize trajectories
-                    B, S, H, W, C = rgbs.shape
-                    trajs_g[..., 0] *= W - 1
-                    trajs_g[..., 1] *= H - 1
-
-                    # Select query points from random frames
-                    if q_frame == -1 and phase == 'val':
-                        fix = int(S * 0.75)
-                    elif q_frame == -2:# or phase == 'test':
-                        fix = torch.randint(0, S, (1,)).item()
-                    else:
-                        fix = q_frame
-
-                    #points_0 = trajs_g[:, :, q_frame, :]  # Initial points from q frame
-                    q_points = randomize_points(trajs_g.permute(0, 2, 1, 3), fix=fix).to(self.device)  # [B, N, 3]
-                    q_points = q_points[..., [0, 2, 1]] #(t, x, y) -> (t, y, x)
-                    # print(q_points[0,0,0])
-                    
-                    with torch.set_grad_enabled(phase == "train"):
-                        # print(rgbs.shape, q_points.shape)
-                        # raise KeyboardInterrupt
-                        outputs = self.model(video=rgbs, query_points=q_points)                        
-                        # print(trajs_e.shape, trajs_g.shape, trajs_e.min(), trajs_e.max(), trajs_g.min(), trajs_g.max())
-                        # raise KeyboardInterrupt
-                        batch_loss = sequence_loss([outputs['tracks']], trajs_g.permute(0, 2, 1, 3), visibs_g, visibs_g, 0.8).mean() # Mean across the batch
-                        # print(loss)
-                        # raise KeyboardInterrupt
-                    
-                        if phase == "train":
-                            optimizer.zero_grad()
-                            batch_loss.backward()
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
-                            optimizer.step()
-                            scheduler.step()
-                        
-                        # Accumulate metrics and loss
-                        epoch_metrics['loss'] += batch_loss.item() * rgbs.size(0)
-                        total_batches += rgbs.size(0)
-
-                        # Normalize predictions and ground truth back to [0, 1]
-                        trajs_e = outputs['tracks'].permute(0, 2, 1, 3)
-                        trajs_g[..., 0] /= W - 1
-                        trajs_g[..., 1] /= H - 1
-                        trajs_e[..., 0] /= W - 1
-                        trajs_e[..., 1] /= H - 1
-                        # points_0[..., 0] /= W - 1
-                        # points_0[..., 1] /= H - 1
-                        q_points[..., 1] /= W - 1
-                        q_points[..., 2] /= H - 1
-
-                        # Evaluate metrics
-                        outputs = evaluate.compute_metrics(
-                            # points_0.cpu().numpy(),
-                            q_points.cpu().numpy(),
-                            trajs_g.permute(0, 2, 1, 3).cpu().numpy(),
-                            visibs_g.cpu().numpy(),
-                            trajs_e.detach().permute(0, 2, 1, 3).cpu().numpy(),
-                            visibs_g.cpu().numpy(),
-                            first=False
-                        )
-                        for key, value in outputs.items():
-                            epoch_metrics[key] += value * rgbs.size(0)  # Accumulate over batch size
-                        
-                # Normalize metrics by dataset size
-                for key in epoch_metrics.keys():
-                    epoch_metrics[key] /= total_batches
-
-                # Logging and saving models
-                if phase == 'val':
-                    saverloader.save(os.path.join(ckpt_path, phase, 'lasts'), optimizer, self.model.module, epoch, scheduler=scheduler)
-                    if epoch_metrics['loss'] <= best_loss:
-                        saverloader.save(os.path.join(ckpt_path, phase), optimizer, self.model.module, epoch, scheduler=scheduler)
-                        best_loss = epoch_metrics['loss']
-                    if epoch_metrics['average_pts_within_thresh'] >= best_davg:
-                        #saving best model based on average position accuracy
-                        saverloader.save(os.path.join(ckpt_path, phase, 'best_davg') , optimizer, self.model.module, epoch, scheduler=scheduler)
-                        best_davg = epoch_metrics['average_pts_within_thresh']
-
-                print(f"Epoch: {epoch} -> {phase}: loss={epoch_metrics['loss']:.4f}, d_avg={epoch_metrics['average_pts_within_thresh']:.4f}")
-                writer.add_scalars(f"{phase}", epoch_metrics, epoch)
-                writer.flush()
-
-        writer.close()
-
+    def train(self, dataloaders, dataset_size, log_dir, ckpt_path, epochs=10, q_frame=0,
+              *, lr=5e-4, weight_decay=1e-6, accumulation_steps=1, max_points=40,
+              gamma=0.8, grad_clip=5.0, validation_fn=None, metadata=None, resume=None):
+        """单视频 micro-batch 训练；轮末验证并保存最佳、最新和恢复状态。"""
+        loader = dataloaders['train']
+        if loader.batch_size != 1 or len(self.device_ids) != 1:
+            raise ValueError("Use one GPU, batch_size=1, and gradient accumulation")
+        if accumulation_steps < 1 or len(loader) == 0:
+            raise ValueError("Invalid accumulation count or empty training loader")
+        if dataset_size['train'] != len(loader.dataset):
+            raise ValueError("dataset_size must count training videos")
+        metadata = metadata or {}
+        steps_per_epoch = math.ceil(len(loader) / accumulation_steps)
+        optimizer, scheduler = fetch_optimizer(lr, weight_decay, 1e-8, epochs,
+                                               steps_per_epoch, self.model.parameters())
+        checkpoint_dir, log_dir = Path(ckpt_path), Path(log_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        start_epoch, global_step, best_score = 0, 0, (-float('inf'), -float('inf'))
+        if resume is not None:
+            checkpoint = saverloader.load_echo_checkpoint(resume, self.model)
+            for key in ('config_sha256', 'prepared_manifest_sha256', 'source_sha256'):
+                if checkpoint['metadata'].get(key) != metadata.get(key):
+                    raise ValueError(f"Resume metadata mismatch: {key}")
+            saverloader.restore_echo_training(checkpoint, optimizer, scheduler, loader.generator)
+            start_epoch, global_step = checkpoint['epoch'], checkpoint['global_step']
+            best_score = tuple(checkpoint['best_score'])
+            del checkpoint
+        elif (checkpoint_dir / 'latest.pth').exists():
+            raise FileExistsError("Run already has a checkpoint; use resume or a new output directory")
+        if scheduler.total_steps != epochs * steps_per_epoch:
+            raise ValueError("Scheduler does not match the optimizer update budget")
+        print(json.dumps(dict(event='training_start', start_epoch=start_epoch, epochs=epochs,
+                              videos=len(loader.dataset), updates_per_epoch=steps_per_epoch,
+                              total_updates=scheduler.total_steps)), flush=True)
+        for epoch in range(start_epoch, epochs):
+            started = time.perf_counter()
+            if hasattr(loader.dataset, 'set_epoch'):
+                loader.dataset.set_epoch(epoch)
+            self.model.train()
+            requires_grad(self.model.parameters(), True)
+            optimizer.zero_grad(set_to_none=True)
+            losses = []
+            for batch, (rgbs, reference, valid) in enumerate(loader):
+                group_start = batch - batch % accumulation_steps
+                group_size = min(accumulation_steps, len(loader) - group_start)
+                loss = self.supervised_loss(rgbs, reference, valid, q_frame, max_points, gamma)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Nonfinite loss at epoch {epoch + 1}, batch {batch}")
+                losses.append(float(loss.detach()))
+                (loss / group_size).backward()
+                del loss
+                if (batch + 1) % accumulation_steps == 0 or batch + 1 == len(loader):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip, error_if_nonfinite=True)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+                if (batch + 1) % 20 == 0 or batch + 1 == len(loader):
+                    print(json.dumps(dict(event='train_progress', epoch=epoch + 1, batch=batch + 1,
+                                          batches=len(loader), global_step=global_step,
+                                          loss=sum(losses) / len(losses))), flush=True)
+            self.model.eval()
+            if validation_fn is not None:
+                metrics = validation_fn()
+            else:
+                rows = []
+                for rgbs, reference, valid in dataloaders['val']:
+                    if rgbs.shape[0] != 1:
+                        raise ValueError("Validation requires batch_size=1")
+                    keep = valid[0, 0] & valid[0, 1:].any(0)
+                    reference, valid = reference[:, :, keep], valid[:, :, keep]
+                    query = torch.zeros((1, int(keep.sum()), 3))
+                    query[..., 1:] = reference[:, 0]
+                    prediction = self.infer(rgbs, query)[0].permute(1, 0, 2).cpu().numpy()
+                    scale = [rgbs.shape[3] - 1, rgbs.shape[2] - 1]
+                    rows.append(evaluate.compute_reference_metrics(reference[0].numpy() * scale,
+                                prediction * scale, valid[0].numpy()))
+                metrics = {k: sum(r[k] for r in rows) / len(rows) for k in rows[0]}
+            score = (metrics['l1_davg_1_2_4'], -metrics['l1_mte'])
+            improved = score > best_score
+            if improved:
+                best_score = score
+            payload = dict(epoch=epoch + 1, global_step=global_step, best_score=best_score,
+                           metadata=metadata, loader_generator=loader.generator)
+            if improved:
+                saverloader.save_echo_checkpoint(checkpoint_dir / 'best.pth', self.model, optimizer, scheduler, **payload)
+            saverloader.save_echo_checkpoint(checkpoint_dir / 'latest.pth', self.model, optimizer, scheduler, **payload)
+            row = dict(epoch=epoch + 1, global_step=global_step, train_loss=sum(losses) / len(losses),
+                       validation=metrics, selected_best=improved, elapsed_seconds=time.perf_counter() - started)
+            with (log_dir / 'history.jsonl').open('a', encoding='utf-8') as f:
+                f.write(json.dumps(row, allow_nan=False) + '\n')
+            print(json.dumps(dict(event='epoch_complete', **row), allow_nan=False), flush=True)
+        return {'epochs': epochs, 'global_step': global_step, 'best_score': best_score}
 
 
 class LOCOTRACK():
