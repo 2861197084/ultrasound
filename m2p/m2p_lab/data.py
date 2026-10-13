@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import OrderedDict
 import hashlib
 import json
 from pathlib import Path
@@ -117,7 +116,7 @@ def affine_pair(image, mask, cfg, rng, params=None):
     return image, mask, params
 
 
-def prepare_pair(im0, im1, mask0, mask1, cfg, rng, augment=False, synthetic=False, echo=False):
+def prepare_pair(im0, im1, mask0, mask1, cfg, rng, augment=False, synthetic=False):
     size = cfg["train_size"]
     images = [im.resize((size, size), Image.Resampling.BILINEAR) for im in (im0, im1)]
     masks = [Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255).resize((size, size), Image.Resampling.NEAREST)
@@ -125,17 +124,13 @@ def prepare_pair(im0, im1, mask0, mask1, cfg, rng, augment=False, synthetic=Fals
     if synthetic:
         images[1], masks[1], _ = affine_pair(images[1], masks[1], cfg, rng)
     if augment:
-        params = None
         for i in range(2):
-            images[i], masks[i], used = affine_pair(images[i], masks[i], cfg, rng, params if echo else None)
-            if echo:
-                params = used
-            strength = 0.1 if echo else cfg["color_jitter"]
+            images[i], masks[i], _ = affine_pair(images[i], masks[i], cfg, rng)
+            strength = cfg["color_jitter"]
             images[i] = TF.adjust_brightness(images[i], float(rng.uniform(1 - strength, 1 + strength)))
             images[i] = TF.adjust_contrast(images[i], float(rng.uniform(1 - strength, 1 + strength)))
-            if not echo:
-                images[i] = TF.adjust_saturation(images[i], float(rng.uniform(1 - strength, 1 + strength)))
-                images[i] = TF.adjust_hue(images[i], float(rng.uniform(-0.05, 0.05)))
+            images[i] = TF.adjust_saturation(images[i], float(rng.uniform(1 - strength, 1 + strength)))
+            images[i] = TF.adjust_hue(images[i], float(rng.uniform(-0.05, 0.05)))
     masks = [np.asarray(m) > 0 for m in masks]
     if min(m.sum() for m in masks) < cfg["groups"] * cfg["points_per_group"]:
         raise ValueError("Foreground too small after transformation")
@@ -183,84 +178,3 @@ class VOSPairs(Dataset):
             except ValueError as error:
                 last_error = error
         raise RuntimeError(f"Cannot sample valid pair for index {index}, video {record['video']}: {last_error}")
-
-
-class EchoPairs(Dataset):
-    def __init__(self, records, cfg, validation=False, length=None):
-        self.records, self.cfg, self.validation = records, cfg, validation
-        self.length = length or (len(records) * cfg["validation_pairs_per_video"] if validation else cfg["echo_steps"] * cfg["effective_batch"])
-        self.cache = OrderedDict()
-
-    def __len__(self):
-        return self.length
-
-    def load(self, record):
-        path = record["path"]
-        if path not in self.cache:
-            with np.load(path, allow_pickle=False) as data:
-                self.cache[path] = {key: data[key] for key in ("images", "masks")}
-            if len(self.cache) > 2:
-                self.cache.popitem(last=False)
-        self.cache.move_to_end(path)
-        return self.cache[path]
-
-    def __getitem__(self, index):
-        rng = np.random.default_rng(stable_seed((self.cfg["seed"], "echo_val" if self.validation else "echo_train", index)))
-        fixed = (index // self.cfg["validation_pairs_per_video"]) % len(self.records)
-        for _ in range(50):
-            record = self.records[fixed if self.validation else int(rng.integers(len(self.records)))]
-            data = self.load(record)
-            i, j = rng.choice(len(data["images"]), 2, replace=False)
-            try:
-                pair = prepare_pair(Image.fromarray(data["images"][i]).convert("RGB"),
-                                    Image.fromarray(data["images"][j]).convert("RGB"),
-                                    data["masks"][i], data["masks"][j], self.cfg, rng,
-                                    augment=not self.validation, echo=True)
-                pair["record_id"] = record["sample_id"]
-                return pair
-            except ValueError:
-                continue
-        raise RuntimeError(f"Cannot sample valid Echo pair from {record['sample_id']}")
-
-
-class ContinuousMaskPairs(Dataset):
-    """Index-seeded sampling; never reads reference trajectories from image NPZs."""
-    def __init__(self, records, cfg, start_index=0, length=None):
-        self.records, self.cfg, self.start_index = records, cfg, start_index
-        self.length = length if length is not None else cfg["echo_steps"] * cfg["effective_batch"] - start_index
-        self.cache = OrderedDict()
-
-    def __len__(self):
-        return self.length
-
-    def load(self, record):
-        key = record["sample_id"]
-        if key not in self.cache:
-            with np.load(record["image_path"], allow_pickle=False) as z:
-                images = z["images"]
-            with np.load(record["mask_path"], allow_pickle=False) as z:
-                masks = z["masks"]
-            self.cache[key] = (images, masks)
-            if len(self.cache) > self.cfg.get("worker_cache_videos", 32):
-                self.cache.popitem(last=False)
-        self.cache.move_to_end(key)
-        return self.cache[key]
-
-    def __getitem__(self, index):
-        absolute = index + self.start_index
-        rng = np.random.default_rng(stable_seed((self.cfg["seed"], "continuous_mask_train", absolute)))
-        record = self.records[int(rng.integers(len(self.records)))]
-        i, j = rng.choice(record["eligible_frames"], 2, replace=False)
-        images, masks = self.load(record)
-        # Retry only augmentation, preserving the uniform video/frame draw.
-        for attempt in range(50):
-            try:
-                result = prepare_pair(Image.fromarray(images[i]).convert("RGB"),
-                    Image.fromarray(images[j]).convert("RGB"), masks[i], masks[j],
-                    self.cfg, rng, augment=True, echo=True)
-                result.update(record_id=record["sample_id"], pair_frames=(int(i), int(j)),
-                              sampling_index=absolute, augmentation_retries=attempt)
-                return result
-            except ValueError:
-                continue
-        raise RuntimeError(f"Invalid augmented pair: {record['sample_id']} frames {i},{j}")

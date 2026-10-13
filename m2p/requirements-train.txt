@@ -4,13 +4,5 @@ torchvision==0.20.1+cu121
 numpy==2.4.6
 scipy==1.17.1
 Pillow==11.3.0
-tqdm==4.67.1
-matplotlib==3.10.7
 pytest==8.4.2
 requests==2.34.2
-zarr==2.18.7
-numcodecs==0.15.1
-einops==0.8.1
-packaging==26.3
-opencv-python-headless==4.11.0.86
-imageio-ffmpeg==0.6.0

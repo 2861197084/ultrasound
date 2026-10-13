@@ -27,12 +27,19 @@
 - 使用 EchoXFlow 官方几何工具转换至 224×224 正方形物理视野。每段保存像素到毫米的仿射变换；图像与标签共享几何增强，误差按每段自身的物理坐标计算。
 - **参考来自软件轮廓，ED/ES 为估计相位，并非专家手工关键点真值。**训练缓存及读取器只有第 0、9 帧坐标；验证和测试包含全部 10 帧坐标。
 
-重新准备数据须保留原始 Zarr、元数据、`splits.csv`、许可证，以及已有的官方几何源码。准备入口不会覆盖已有派生目录：
+数据准备使用本项目的 Python 3.13 环境 `.venv-data/`。官方扫描转换源码固定为 `b782e0a4e3dbaadf3c88fa572710bf4254d86143`，保存在 `vendor/echoxflow-b782e0a4e3dbaadf3c88fa572710bf4254d86143/`，含原始许可证；源码缺失时从[该固定版本](https://github.com/Ahus-AIM/EchoXFlow/tree/b782e0a4e3dbaadf3c88fa572710bf4254d86143)恢复到此目录。数据环境可在本项目目录重建：
 
 ```bash
-cd /root/ultrasound
+python3.13 -m venv .venv-data
+.venv-data/bin/python -m pip install -r requirements-data.txt
+```
+
+重新准备数据须保留原始 Zarr、元数据、`splits.csv`、许可证。准备入口不会覆盖已有派生目录：
+
+```bash
+cd /root/ultrasound/SemiEchoTracker
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
-  m2p/.venv-data/bin/python -B SemiEchoTracker/dataset/prepare_echoxflow.py --workers 4
+  .venv-data/bin/python -B dataset/prepare_echoxflow.py --workers 4
 ```
 
 ## 运行

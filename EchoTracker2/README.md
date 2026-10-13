@@ -214,11 +214,18 @@ model.train(
 
 本轮实验的数据处理、划分、论文评估口径和完整结果见 [实验结果讲解报告](outputs/echoxflow_a4c/RESULTS_zh.md)。
 
-工作目录：`/root/ultrasound/EchoTracker2`。配置入口为 `echoxflow_a4c.json`，物理 GPU 1 通过 UUID 绑定，进程内映射为 `cuda:0`。准备阶段复用 `../m2p/.venv-data` 的 Python 3.13 与固定版本官方扫描转换源码；训练和评测使用本目录 `.venv` 的 Python 3.11 / PyTorch 2.5.1。
+工作目录：`/root/ultrasound/EchoTracker2`。配置入口为 `echoxflow_a4c.json`，物理 GPU 1 通过 UUID 绑定，进程内映射为 `cuda:0`。训练和评测使用本目录 `.venv` 的 Python 3.11 / PyTorch 2.5.1。
+
+数据准备使用本项目的 Python 3.13 环境 `.venv-data/`。官方扫描转换源码固定为 `b782e0a4e3dbaadf3c88fa572710bf4254d86143`，保存在 `vendor/echoxflow-b782e0a4e3dbaadf3c88fa572710bf4254d86143/`，含原始许可证；源码缺失时从[该固定版本](https://github.com/Ahus-AIM/EchoXFlow/tree/b782e0a4e3dbaadf3c88fa572710bf4254d86143)恢复到此目录。数据环境可在本项目目录重建：
+
+```bash
+python3.13 -m venv .venv-data
+.venv-data/bin/python -m pip install -r requirements-data.txt
+```
 
 ```bash
 # 从共享原始库核验、扫描转换并准备 A4C 缓存。
-../m2p/.venv-data/bin/python -B echoxflow.py prepare
+.venv-data/bin/python -B echoxflow.py prepare
 
 # 原始权重和静止点基线。
 .venv/bin/python -B echoxflow.py evaluate --model pretrained static

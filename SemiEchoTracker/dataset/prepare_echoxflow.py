@@ -11,20 +11,79 @@ import sys
 import tempfile
 
 import numpy as np
+from scipy.ndimage import median_filter
 import zarr
 from tqdm import tqdm
 
-ROOT = Path(__file__).resolve().parents[2]
+PROJECT = Path(__file__).resolve().parents[1]
+ROOT = PROJECT.parent
 DATA_REVISION = "d907c536cae16750b9e46f269a27befd4979ebdd"
 CODE_REVISION = "b782e0a4e3dbaadf3c88fa572710bf4254d86143"
-VENDOR = ROOT / "m2p/vendor" / f"echoxflow-{CODE_REVISION}"
+VENDOR = PROJECT / "vendor" / f"echoxflow-{CODE_REVISION}"
 sys.path.insert(0, str(VENDOR / "src"))
-sys.path.insert(0, str(ROOT / "m2p/scripts"))
 from echoxflow.scan.conversion import sector_to_cartesian
 from echoxflow.scan.geometry import (
     CartesianGrid, physical_points_to_pixels, sector_geometry_from_mapping,
 )
-from download_echoxflow_edes import select_phases, align_phases
+
+
+def select_phases(contours, times, qrs):
+    """Estimate ED BEFORE ES from one software-annotated cardiac cycle.
+
+    ES = minimum of the 3-frame median-filtered endocardial polygon area;
+    ED = maximum preceding ES. QRS proximity is an audit, not an ES label.
+    All thresholds only flag review cases and never create clinical truth.
+    """
+    if contours.ndim != 3 or contours.shape[2] != 2 or contours.shape[1] % 5 or len(contours) < 8:
+        raise ValueError("invalid_lv_contour_layout")
+    if not np.isfinite(contours).all() or not np.isfinite(times).all() or not np.all(np.diff(times)>0):
+        raise ValueError("invalid_contour_coordinates_or_timestamps")
+    endo = contours[:, ::5].astype(np.float64)
+    x, y = endo[..., 0], endo[..., 1]
+    area = abs(np.sum(x*np.roll(y, -1, axis=1)-y*np.roll(x, -1, axis=1), axis=1)*.5)
+    if (area <= 0).any():
+        raise ValueError("nonpositive_lv_cavity_area")
+    smooth = median_filter(area, size=3, mode="nearest")
+    es = int(np.argmin(smooth))
+    if es < 2 or es >= len(area)-1:
+        raise ValueError("no_valid_preceding_ED_and_interior_ES")
+    ed = int(np.argmax(smooth[:es]))
+    flags = []
+    if smooth[ed] <= smooth[es]:
+        raise ValueError("no_cavity_area_contraction")
+    duration = float(times[-1]-times[0])
+    if smooth[ed] < .9 * smooth.max():
+        flags.append("preceding_ED_area_below_90pct_cycle_max")
+    if smooth[es]/smooth[ed] > .95:
+        flags.append("weak_area_change")
+    if not .1 <= (times[es]-times[0])/duration <= .8:
+        flags.append("ES_outside_central_cycle_window")
+    if times[es]-times[ed] < .08:
+        flags.append("ED_ES_interval_below_80ms")
+    qrs = np.asarray(qrs, dtype=float)
+    qrs = np.unique(qrs[np.isfinite(qrs)])
+    offset = float(np.min(abs(qrs-times[ed]))) if len(qrs) else None
+    rr = float(np.median(np.diff(qrs))) if len(qrs)>1 else None
+    if rr is None:
+        flags.append("QRS_cycle_unavailable")
+    elif offset > .2 * rr:
+        flags.append("ED_far_from_QRS")
+    return np.array([ed,es]), dict(method="preceding_area_max_then_area_min_median3", label_status="estimated_not_official",
+        area_m2=area.tolist(), smoothed_area_m2=smooth.tolist(), contour_times_seconds=times.tolist(),
+        ED_contour_index=ed, ES_contour_index=es, ED_ES_interval_seconds=float(times[es]-times[ed]),
+        ES_ED_area_ratio=float(smooth[es]/smooth[ed]), ED_nearest_QRS_seconds=offset,
+        median_RR_seconds=rr, qrs_timestamps_seconds=qrs.tolist(), flags=flags)
+
+def align_phases(ct, bt, selected):
+    if not np.isfinite(bt).all() or not np.all(np.diff(bt)>0):
+        raise ValueError("nonmonotonic_image_timestamps")
+    tolerance = float(np.median(np.diff(bt))*.5+1e-6)
+    distances = abs(ct[selected, None]-bt[None,:])
+    bi = distances.argmin(axis=1)
+    errors = distances[np.arange(2),bi]
+    if (errors>tolerance).any() or bi[0]>=bi[1]:
+        raise ValueError("ED_ES_image_timestamp_alignment_failed")
+    return bi, errors, tolerance
 
 
 def file_sha(path):
@@ -231,7 +290,7 @@ def main():
             geometry_code_revision=CODE_REVISION, raw_root=str(args.raw.resolve()),
             source_metadata_sha256={name: file_sha(args.raw / name) for name in ("croissant.json", "splits.csv", "LICENSE")},
             preparation_code_sha256=file_sha(__file__),
-            phase_code_sha256=file_sha(ROOT / "m2p/scripts/download_echoxflow_edes.py"),
+            phase_code_sha256=file_sha(__file__),
             counts=dict(Counter(r["split"] for r in prepared)),
             exam_counts={s: len(ids) for s, ids in exam_sets.items()}, split_sha256=split_hashes,
             protocol="10 real ED-to-ES frames; train endpoint labels only; fixed ED endocardial indices",

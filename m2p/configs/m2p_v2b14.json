@@ -25,9 +25,7 @@
   "natural_steps": 150000,
   "decay_step": 110000,
   "decay_factor": 0.1,
-  "echo_steps": 20000,
   "natural_validation_every": 5000,
-  "echo_validation_every": 1000,
   "validation_pairs_per_video": 2,
   "loader_workers": 4,
   "torch_threads": 4,
@@ -45,7 +43,7 @@
   "coordinates": "Input-image pixel xy coordinates; feature patch centers at patch_size/2 + k*patch_size; boundary distances and Huber residuals use input pixels.",
   "assumptions": [
     "LoRA alpha=rank; LoRA on combined QKV, attention projection, fc1 and fc2 in every transformer block.",
-    "Frozen initialization backbone generates teacher matches. The transfer experiment uses a frozen copy of its natural-video initialization as teacher.",
+    "Frozen initialization backbone generates teacher matches.",
     "Sample videos uniformly from the combined training set; choose an object and two distinct annotated frames uniformly, resampling invalid small objects.",
     "K-means uses up to 4096 uniformly sampled foreground pixels and 10 Lloyd iterations; FPS selects 12 queries per cluster, repeating only in undersized nonempty clusters.",
     "Two normalized 3x3 convolutions with 16 hidden channels and ReLU follow the cited DINO-Tracker head; local radius 35 input pixels, softmax temperature 1.",

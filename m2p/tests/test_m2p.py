@@ -1,7 +1,5 @@
 import json
 import math
-from pathlib import Path
-import tempfile
 
 import m2p_lab  # Enforce physical GPU 1 before importing torch.
 import numpy as np
@@ -16,7 +14,8 @@ from m2p_lab.evaluation import official_metrics
 from m2p_lab.geometry import (boundary_distances, grouped_queries, pixel_grid,
                               sample_pixels, similarity_transform, teacher_pseudopoints)
 from m2p_lab.model import LoRALinear, M2P, local_soft_argmax, objective
-from m2p_lab.runtime import RUN, check_gpu, load_config, save_best, seed_everything
+from m2p_lab import runtime
+from m2p_lab.runtime import check_gpu, load_config, save_best, seed_everything
 
 
 def test_pixel_sampling_and_coordinate_gradients():
@@ -125,12 +124,14 @@ def test_validation_init_masks_are_not_mistaken_for_dense_annotations(tmp_path):
 
 
 @pytest.fixture(scope="module")
-def cuda_model():
+def cuda_model(tmp_path_factory):
     cfg = load_config()
-    check_gpu(cfg)
-    seed_everything(cfg['seed'])
-    model = M2P(cfg).cuda()
-    return model, model.frozen_teacher(), cfg
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(runtime, "RUN", tmp_path_factory.mktemp("m2p-runtime"))
+        check_gpu(cfg)
+        seed_everything(cfg['seed'])
+        model = M2P(cfg).cuda()
+        yield model, model.frozen_teacher(), cfg
 
 
 def example_batch(cfg):
@@ -158,25 +159,23 @@ def test_full_objective_updates_only_adapters(cuda_model):
     model.zero_grad(set_to_none=True)
 
 
-def test_best_checkpoint_replaces_and_reloads_exact_predictions(cuda_model):
+def test_best_checkpoint_replaces_and_reloads_exact_predictions(cuda_model, tmp_path):
     model, teacher, cfg = cuda_model
     model.eval()
     batch = example_batch(cfg)
     with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
         expected = model.predict_pair(batch['image0'], batch['image1'], batch['queries'].reshape(1, -1, 2))[0]
-    (RUN / 'preflight').mkdir(exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=RUN / 'preflight') as folder:
-        path = Path(folder) / 'best.pt'
-        save_best(model, path, cfg, 1, {'total': 2.0}, {'test': True})
-        save_best(model, path, cfg, 2, {'total': 1.0}, {'test': True})
-        assert [p.name for p in Path(folder).iterdir()] == ['best.pt']
-        saved = torch.load(path, weights_only=True, map_location='cpu')
-        assert saved['step'] == 2
-        assert path.stat().st_size < 45 * 1024**2
-        assert not any('optimizer' in key for key in saved)
-        with torch.no_grad():
-            next(p for p in model.parameters() if p.requires_grad).add_(1)
-        model.load_adapter(saved['adapter'])
-        with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
-            actual = model.predict_pair(batch['image0'], batch['image1'], batch['queries'].reshape(1, -1, 2))[0]
-        assert torch.equal(expected, actual)
+    path = tmp_path / 'best.pt'
+    save_best(model, path, cfg, 1, {'total': 2.0}, {'test': True})
+    save_best(model, path, cfg, 2, {'total': 1.0}, {'test': True})
+    assert [p.name for p in tmp_path.iterdir()] == ['best.pt']
+    saved = torch.load(path, weights_only=True, map_location='cpu')
+    assert saved['step'] == 2
+    assert path.stat().st_size < 45 * 1024**2
+    assert not any('optimizer' in key for key in saved)
+    with torch.no_grad():
+        next(p for p in model.parameters() if p.requires_grad).add_(1)
+    model.load_adapter(saved['adapter'])
+    with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+        actual = model.predict_pair(batch['image0'], batch['image1'], batch['queries'].reshape(1, -1, 2))[0]
+    assert torch.equal(expected, actual)

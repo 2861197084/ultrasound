@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import json
 import math
-from pathlib import Path
 import time
 
 import numpy as np
@@ -111,7 +110,7 @@ def accumulated_step(model, teacher, optimizer, batch, micro_batch):
 
 
 def train(model, teacher, train_data, validation_data, cfg, name, steps, validation_every, provenance,
-          preflight=False, start_checks=True, recovery=None):
+          recovery=None):
     out = RUN / name
     out.mkdir(parents=True, exist_ok=True)
     model.train()

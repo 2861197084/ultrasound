@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import random
 import shutil
-import time
 
 import numpy as np
 import torch
@@ -84,12 +83,6 @@ def guard_disk(config, additional=0):
 
 def load_config(path=None):
     return json.loads(Path(path or ROOT / "configs/m2p_v2b14.json").read_text())
-
-
-def configure(config):
-    global RUN
-    RUN = Path(config["output"]).resolve()
-    RUN.mkdir(parents=True, exist_ok=True)
 
 
 def file_sha(path):

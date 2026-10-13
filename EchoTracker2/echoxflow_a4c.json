@@ -1,6 +1,6 @@
 {
   "raw_root": "../data/echoxflow/raw",
-  "scan_source": "../m2p/vendor/echoxflow-b782e0a4e3dbaadf3c88fa572710bf4254d86143/src",
+  "scan_source": "vendor/echoxflow-b782e0a4e3dbaadf3c88fa572710bf4254d86143/src",
   "output": "outputs/echoxflow_a4c",
   "checkpoint": "weights/echotracker2/model-0.pth",
   "data_revision": "d907c536cae16750b9e46f269a27befd4979ebdd",

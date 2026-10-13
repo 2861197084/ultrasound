@@ -42,17 +42,8 @@ echoxflow/
 
 官方工具可设置 `ECHOXFLOW_DATA_ROOT=/root/ultrasound/data/echoxflow/raw`，项目保留的官方工具版本为 `b782e0a4e3dbaadf3c88fa572710bf4254d86143`。
 
-## 下载与校验
+## 项目数据准备入口
 
-```bash
-# 查看下载范围；结果输出到终端。
-/root/ultrasound/m2p/.venv-data/bin/python -B /root/ultrasound/m2p/scripts/download_echoxflow_raw.py plan
-# 补齐缺失或损坏的记录。
-/root/ultrasound/m2p/.venv-data/bin/python -B /root/ultrasound/m2p/scripts/download_echoxflow_raw.py fetch --workers 4
-# 解码全部数组，检查官方形状、类型、内容校验和及划分。
-/root/ultrasound/m2p/.venv-data/bin/python -B /root/ultrasound/m2p/scripts/download_echoxflow_raw.py verify --workers 4
-```
-
-下载器直接使用 `source/` 的官方元数据；已存在的数据通过官方数组校验后复用。缺失记录通过 HTTP Range 获取全部原始成员，TAR 索引仅在内存中使用。默认 4 个并发，保留至少 35 GiB 空闲空间，不下载整检查 TAR。下载时暂存到 `.staging/`，校验成功后提交，空暂存目录自动移除。进度和校验结果仅输出到终端。
+官方固定版本源码及独立数据环境分别保存在 EchoTracker2、SemiEchoTracker 项目内。具体环境安装与缓存准备命令见 [EchoTracker2 说明](/root/ultrasound/EchoTracker2/README.md)和 [SemiEchoTracker 说明](/root/ultrasound/SemiEchoTracker/README.md)。原始数据读取、数组校验与派生缓存生成由各项目入口执行。
 
 来源：[官方数据](https://huggingface.co/datasets/Ahus-AIM/EchoXFlow/tree/d907c536cae16750b9e46f269a27befd4979ebdd) · [官方工具](https://github.com/Ahus-AIM/EchoXFlow/tree/b782e0a4e3dbaadf3c88fa572710bf4254d86143)。

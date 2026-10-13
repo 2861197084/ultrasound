@@ -1,3 +1,4 @@
+# Python 3.13；固定已验证的数据准备依赖。
 certifi==2026.7.22
 charset-normalizer==3.5.2
 donfig==0.8.1.post1
