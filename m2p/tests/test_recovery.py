@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
-from m2p_lab import recovery, training
+from m2p_lab import recovery, training, runtime
 
 
 class TinyModel(torch.nn.Module):
@@ -68,7 +68,7 @@ def test_recovery_uses_correct_data_cursor_lr_and_keeps_better_checkpoint(tmp_pa
         seen.extend(batch['image0'][:,0].tolist()); rates.append(optimizer.param_groups[0]['lr'])
         optimizer.zero_grad(); model.layer.b.square().sum().backward(); optimizer.step()
         return dict(total=2.,lsc=1.,mlc=1.,mbc=1.,foreground_mass=.5,valid_lsc_groups=.5), micro
-    monkeypatch.setattr(training, 'RUN', tmp_path)
+    monkeypatch.setattr(runtime, 'RUN', tmp_path)
     monkeypatch.setattr(training, 'accumulated_step', step)
     monkeypatch.setattr(training, 'validate', lambda *a: {'total': 2.0})
     monkeypatch.setattr(training, 'guard_disk', lambda *a: None)

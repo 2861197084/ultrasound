@@ -1,7 +1,8 @@
 import json
 import math
+import os
 
-import m2p_lab  # Enforce physical GPU 1 before importing torch.
+import m2p_lab
 import numpy as np
 from PIL import Image
 import pytest
@@ -125,7 +126,7 @@ def test_validation_init_masks_are_not_mistaken_for_dense_annotations(tmp_path):
 
 @pytest.fixture(scope="module")
 def cuda_model(tmp_path_factory):
-    cfg = load_config()
+    cfg = load_config(os.environ.get("M2P_TEST_CONFIG"))
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(runtime, "RUN", tmp_path_factory.mktemp("m2p-runtime"))
         check_gpu(cfg)
@@ -166,11 +167,14 @@ def test_best_checkpoint_replaces_and_reloads_exact_predictions(cuda_model, tmp_
     with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
         expected = model.predict_pair(batch['image0'], batch['image1'], batch['queries'].reshape(1, -1, 2))[0]
     path = tmp_path / 'best.pt'
-    save_best(model, path, cfg, 1, {'total': 2.0}, {'test': True})
-    save_best(model, path, cfg, 2, {'total': 1.0}, {'test': True})
+    provenance = {'gpu': check_gpu(cfg)}
+    assert type(provenance['gpu']['torch']) is str
+    save_best(model, path, cfg, 1, {'total': 2.0}, provenance)
+    save_best(model, path, cfg, 2, {'total': 1.0}, provenance)
     assert [p.name for p in tmp_path.iterdir()] == ['best.pt']
     saved = torch.load(path, weights_only=True, map_location='cpu')
     assert saved['step'] == 2
+    assert saved['provenance'] == provenance
     assert path.stat().st_size < 45 * 1024**2
     assert not any('optimizer' in key for key in saved)
     with torch.no_grad():

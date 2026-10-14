@@ -12,7 +12,8 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
 from .geometry import boundary_distances, grouped_queries
-from .runtime import ROOT, RUN, atomic_json
+from . import runtime
+from .runtime import ROOT, atomic_json
 
 
 def stable_seed(value):
@@ -90,7 +91,7 @@ def index_natural():
                    counts=dict(youtube_train=len(train), davis_train=len(davis),
                                youtube_validation=len(chosen_val), validation_real_pair_videos=len(real_val)),
                    note="Validation masks select checkpoints; no benchmark point annotations are used for model selection.")
-    atomic_json(RUN / "natural_manifest.json", payload)
+    atomic_json(runtime.RUN / "natural_manifest.json", payload)
     return payload
 
 
@@ -129,8 +130,9 @@ def prepare_pair(im0, im1, mask0, mask1, cfg, rng, augment=False, synthetic=Fals
             strength = cfg["color_jitter"]
             images[i] = TF.adjust_brightness(images[i], float(rng.uniform(1 - strength, 1 + strength)))
             images[i] = TF.adjust_contrast(images[i], float(rng.uniform(1 - strength, 1 + strength)))
-            images[i] = TF.adjust_saturation(images[i], float(rng.uniform(1 - strength, 1 + strength)))
-            images[i] = TF.adjust_hue(images[i], float(rng.uniform(-0.05, 0.05)))
+            if not cfg.get("grayscale_jitter", False):
+                images[i] = TF.adjust_saturation(images[i], float(rng.uniform(1 - strength, 1 + strength)))
+                images[i] = TF.adjust_hue(images[i], float(rng.uniform(-0.05, 0.05)))
     masks = [np.asarray(m) > 0 for m in masks]
     if min(m.sum() for m in masks) < cfg["groups"] * cfg["points_per_group"]:
         raise ValueError("Foreground too small after transformation")

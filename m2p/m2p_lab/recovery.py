@@ -9,7 +9,7 @@ import shutil
 
 import torch
 
-from .runtime import atomic_json, event, file_sha, guard_disk
+from .runtime import atomic_json, event, file_sha, guard_disk, scientific_config
 
 
 def prepare_best_resume(out, cfg, target_steps):
@@ -19,7 +19,7 @@ def prepare_best_resume(out, cfg, target_steps):
     start = saved["step"]
     if not 0 < start < target_steps:
         raise RuntimeError(f"Checkpoint step cannot be continued: {start}/{target_steps}")
-    if saved["config"] != cfg:
+    if scientific_config(saved["config"]) != scientific_config(cfg):
         raise RuntimeError("Recovery configuration differs from the saved experiment")
     if not all(torch.isfinite(t).all() for t in saved["adapter"].values()):
         raise RuntimeError("Retained checkpoint has nonfinite parameters")

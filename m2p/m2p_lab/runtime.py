@@ -8,14 +8,43 @@ import os
 from pathlib import Path
 import random
 import shutil
+import subprocess
 
 import numpy as np
 import torch
 
-from . import GPU_UUID
-
 ROOT = Path(__file__).resolve().parents[1]
 RUN = ROOT / "runs/m2p_reproduction"
+
+
+def configure_run(config):
+    global RUN
+    RUN = (ROOT / config.get("run_dir", "runs/m2p_reproduction")).resolve()
+    return RUN
+
+
+def select_gpu(config):
+    """Resolve the configured physical index before the first CUDA operation."""
+    index = config.get("gpu", 1)
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError("gpu must be a nonnegative physical GPU index")
+    output = subprocess.check_output([
+        "nvidia-smi", f"--id={index}", "--query-gpu=uuid,pci.bus_id", "--format=csv,noheader,nounits"
+    ], text=True).strip()
+    uuid, pci = [value.strip() for value in output.split(",")]
+    if torch.cuda.is_initialized() and os.environ.get("CUDA_VISIBLE_DEVICES") != uuid:
+        raise RuntimeError("CUDA is already initialized on a different device; start a new process")
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = uuid
+    return dict(physical_device=index, uuid=uuid, pci_bus=pci.lower())
+
+
+def scientific_config(config):
+    runtime_keys = {"gpu", "run_dir", "loader_workers", "torch_threads", "log_every",
+                    "reserve_gib", "artifact_budget_gib", "eval_chunk_size", "natural_validation_mode"}
+    result = {key: value for key, value in config.items() if key not in runtime_keys}
+    result.setdefault("dataset", "natural")
+    return result
 
 
 def timestamp():
@@ -50,23 +79,23 @@ def seed_everything(seed):
 
 
 def check_gpu(config):
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != GPU_UUID:
-        raise RuntimeError("GPU isolation was changed")
+    selected = select_gpu(config)
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise RuntimeError("Exactly one CUDA device must be visible")
     driver = ctypes.CDLL("libcuda.so.1")
     bus = ctypes.create_string_buffer(64)
     if driver.cuInit(0) or driver.cuDeviceGetPCIBusId(bus, 64, 0):
         raise RuntimeError("Cannot verify CUDA device identity")
-    if bus.value.decode().lower() != "0000:07:00.0":
-        raise RuntimeError("Visible CUDA device is not physical GPU 1")
+    actual_bus = bus.value.decode().lower()
+    if actual_bus.split(":")[-2:] != selected["pci_bus"].split(":")[-2:]:
+        raise RuntimeError("Visible CUDA device does not match the configured physical GPU")
     torch.set_num_threads(config["torch_threads"])
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     free, total = torch.cuda.mem_get_info()
-    info = dict(uuid=GPU_UUID, physical_device=1, logical_device=0, pci_bus=bus.value.decode(),
+    info = dict(**selected, logical_device=0,
                 name=torch.cuda.get_device_name(0), free_bytes=free, total_bytes=total,
-                torch=torch.__version__, cuda=torch.version.cuda)
+                torch=str(torch.__version__), cuda=torch.version.cuda)
     event("gpu_verified", **info)
     return info
 

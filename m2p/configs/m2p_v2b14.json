@@ -50,5 +50,8 @@
     "The top three teacher matches supervise their own queries; the estimated similarity transform supervises the remaining nine, following Eqs. 4-6. Degenerate groups do not contribute to LSC.",
     "RandomAffine magnitudes and ColorJitter strength are reproduction defaults, not published M2P hyperparameters.",
     "Primary TAP-Vid metric is visible-point delta average. Match confidence is not a calibrated occlusion predictor; do not claim reproduction of AJ/OA without an occlusion protocol."
-  ]
+  ],
+  "dataset": "natural",
+  "gpu": 1,
+  "run_dir": "runs/m2p_reproduction"
 }

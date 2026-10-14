@@ -10,10 +10,11 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from .model import objective, teacher_targets
-from .runtime import RUN, atomic_json, event, guard_disk, save_best, status
+from . import runtime
+from .runtime import atomic_json, event, guard_disk, save_best, status
 
 
-def fixed_validation_subset(dataset, name):
+def fixed_validation_subset(dataset, name, strict=False):
     valid, excluded = [], []
     for index in range(len(dataset)):
         try:
@@ -21,12 +22,16 @@ def fixed_validation_subset(dataset, name):
             if all(torch.isfinite(v).all() for v in sample.values() if isinstance(v, torch.Tensor)):
                 valid.append(index)
             else:
+                if strict:
+                    raise ValueError(f"Nonfinite validation pair: {index}")
                 excluded.append(dict(index=index, reason="nonfinite_pair"))
         except (ValueError, RuntimeError) as error:
+            if strict:
+                raise
             excluded.append(dict(index=index, reason=str(error)))
     if not valid:
         raise RuntimeError("No valid independent validation pairs")
-    atomic_json(RUN / name / "validation_selection.json", dict(indices=valid, exclusions=excluded,
+    atomic_json(runtime.RUN / name / "validation_selection.json", dict(indices=valid, exclusions=excluded,
                 policy="Fixed seed and fixed pairs; exclusions determined before optimization"))
     return Subset(dataset, valid)
 
@@ -111,7 +116,7 @@ def accumulated_step(model, teacher, optimizer, batch, micro_batch):
 
 def train(model, teacher, train_data, validation_data, cfg, name, steps, validation_every, provenance,
           recovery=None):
-    out = RUN / name
+    out = runtime.RUN / name
     out.mkdir(parents=True, exist_ok=True)
     model.train()
     teacher.eval()
